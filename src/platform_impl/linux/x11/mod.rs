@@ -262,10 +262,26 @@ impl<T: 'static> EventLoop<T> {
             .xconn
             .select_xkb_events(
                 0x100, // Use the "core keyboard device"
-                ffi::XkbNewKeyboardNotifyMask | ffi::XkbMapNotifyMask | ffi::XkbStateNotifyMask,
+                ffi::XkbNewKeyboardNotifyMask | ffi::XkbMapNotifyMask,
             )
             .unwrap()
             .queue();
+
+        #[allow(non_upper_case_globals)]
+        {
+            // TODO: Remove constants after https://github.com/AltF02/x11-rs/pull/133 is published
+            const XkbPointerButtonMask: c_ulong = 1 << 13;
+            const XkbAllStateComponentsMask: c_ulong = 0x3fff;
+            get_xtarget(&target)
+                .xconn
+                .select_xkb_event_details(
+                    0x100, // Use the "core keyboard device"
+                    ffi::XkbStateNotify as c_uint,
+                    XkbAllStateComponentsMask & !XkbPointerButtonMask,
+                )
+                .unwrap()
+                .queue();
+        }
 
         event_processor.init_device(ffi::XIAllDevices);
 

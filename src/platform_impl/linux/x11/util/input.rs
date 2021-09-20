@@ -91,6 +91,23 @@ impl XConnection {
         }
     }
 
+    pub fn select_xkb_event_details(
+        &self,
+        device_id: c_uint,
+        event: c_uint,
+        mask: c_ulong,
+    ) -> Option<Flusher<'_>> {
+        let status = unsafe {
+            (self.xlib.XkbSelectEventDetails)(self.display, device_id, event, mask, mask)
+        };
+        if status == ffi::True {
+            Some(Flusher::new(self))
+        } else {
+            error!("Could not select XKB events: The XKB extension is not initialized!");
+            None
+        }
+    }
+
     pub fn query_pointer(
         &self,
         window: ffi::Window,
