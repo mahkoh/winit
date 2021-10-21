@@ -81,16 +81,6 @@ impl XConnection {
         Flusher::new(self)
     }
 
-    pub fn select_xkb_events(&self, device_id: c_uint, mask: c_ulong) -> Option<Flusher<'_>> {
-        let status = unsafe { (self.xlib.XkbSelectEvents)(self.display, device_id, mask, mask) };
-        if status == ffi::True {
-            Some(Flusher::new(self))
-        } else {
-            error!("Could not select XKB events: The XKB extension is not initialized!");
-            None
-        }
-    }
-
     pub fn query_pointer(
         &self,
         window: ffi::Window,
