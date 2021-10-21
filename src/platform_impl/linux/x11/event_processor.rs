@@ -562,6 +562,10 @@ impl<T: 'static> EventProcessor<T> {
                 }
             }
 
+            ffi::MappingNotify => {
+                unsafe { self.kb_state.init_with_x11_keymap() };
+            }
+
             ffi::GenericEvent => {
                 let guard = if let Some(e) = GenericEventCookie::from_event(&wt.xconn, *xev) {
                     e
@@ -1081,44 +1085,6 @@ impl<T: 'static> EventProcessor<T> {
                     }
 
                     ffi::XI_RawKeyPress | ffi::XI_RawKeyRelease => {
-                        // This is horrible, but I couldn't manage to respect keyboard layout changes
-                        // in any other way. In fact, getting this to work at all proved so frustrating
-                        // that I (@maroider) lost motivation to work on the keyboard event rework for
-                        // some months. Thankfully, @ArturKovacs offered to help debug the problem
-                        // over discord, and the following is the result of that debugging session.
-                        //
-                        // Without the XKB extension, the X.Org server sends us the `MappingNotify`
-                        // event when there's been a change in the keyboard layout. This stops
-                        // being the case when we select ourselves some XKB events with `XkbSelectEvents`
-                        // and the "core keyboard device (0x100)" (we haven't tried with any other
-                        // devices). We managed to reproduce this on both our machines.
-                        //
-                        // With the XKB extension active, it would seem like we're supposed to use the
-                        // `XkbStateNotify` event to detect keyboard layout changes, but the `group`
-                        // never changes value (it is always `0`). This worked for @ArturKovacs, but
-                        // not for me. We also tried to use the `group` given to us in keypress events,
-                        // but it remained constant there, too.
-                        //
-                        // We also tried to see if there was some other event that got fired when the
-                        // keyboard layout changed, and we found a mysterious event with the value
-                        // `85` (`0x55`). We couldn't find any reference to it in the X11 headers or
-                        // in the X.Org server source.
-                        //
-                        // `KeymapNotify` did briefly look interesting based purely on the name, but
-                        // it is only useful for checking what keys are pressed when we receive the
-                        // event.
-                        //
-                        // So instead of any vaguely reasonable approach, we get this: reloading the
-                        // keymap on *every* keypress. That's peak efficiency right there!
-                        //
-                        // FIXME: Someone please save our souls! Or at least our wasted CPU cycles.
-                        //
-                        //        If you do manage to find a solution, remember to re-enable (and handle) the
-                        //        `XkbStateNotify` event with `XkbSelectEventDetails` with a mask of
-                        //        `XkbAllStateComponentsMask & !XkbPointerButtonMask` like in
-                        //        <https://github.com/maroider/winit/pull/2>.
-                        unsafe { self.kb_state.init_with_x11_keymap() };
-
                         let xev: &ffi::XIRawEvent = unsafe { &*(xev.data as *const _) };
 
                         let state = match xev.evtype {
