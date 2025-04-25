@@ -1,15 +1,17 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::mem;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 use std::time::Instant;
 
+use dispatch2::MainThreadBound;
+use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSRunningApplication};
-use objc2_foundation::{MainThreadMarker, NSNotification};
+use objc2_foundation::NSNotification;
 
 use super::super::event_handler::EventHandler;
-use super::event_loop::{stop_app_immediately, ActiveEventLoop, EventLoopProxy, PanicInfo};
+use super::super::event_loop_proxy::EventLoopProxy;
+use super::event_loop::{notify_windows_of_exit, stop_app_immediately, ActiveEventLoop, PanicInfo};
 use super::menu;
 use super::observer::{EventLoopWaker, RunLoop};
 use crate::application::ApplicationHandler;
@@ -45,22 +47,10 @@ pub(super) struct AppState {
     // as such should be careful to not add fields that, in turn, strongly reference those.
 }
 
-// TODO(madsmtm): Use `MainThreadBound` once that is possible in `static`s.
-struct StaticMainThreadBound<T>(T);
-
-impl<T> StaticMainThreadBound<T> {
-    const fn get(&self, _mtm: MainThreadMarker) -> &T {
-        &self.0
-    }
-}
-
-unsafe impl<T> Send for StaticMainThreadBound<T> {}
-unsafe impl<T> Sync for StaticMainThreadBound<T> {}
-
-// SAFETY: Creating `StaticMainThreadBound` in a `const` context, where there is no concept of the
+// SAFETY: Creating `MainThreadBound` in a `const` context, where there is no concept of the
 // main thread.
-static GLOBAL: StaticMainThreadBound<OnceCell<Rc<AppState>>> =
-    StaticMainThreadBound(OnceCell::new());
+static GLOBAL: MainThreadBound<OnceCell<Rc<AppState>>> =
+    MainThreadBound::new(OnceCell::new(), unsafe { MainThreadMarker::new_unchecked() });
 
 impl AppState {
     pub(super) fn setup_global(
@@ -69,13 +59,17 @@ impl AppState {
         default_menu: bool,
         activate_ignoring_other_apps: bool,
     ) -> Rc<Self> {
-        let this = Rc::new(AppState {
+        let event_loop_proxy = Arc::new(EventLoopProxy::new(mtm, move || {
+            Self::get(mtm).with_handler(|app, event_loop| app.proxy_wake_up(event_loop));
+        }));
+
+        let this = Rc::new(Self {
             mtm,
             activation_policy,
-            event_loop_proxy: Arc::new(EventLoopProxy::new()),
             default_menu,
             activate_ignoring_other_apps,
             run_loop: RunLoop::main(mtm),
+            event_loop_proxy,
             event_handler: EventHandler::new(),
             stop_on_launch: Cell::new(false),
             stop_before_wait: Cell::new(false),
@@ -162,7 +156,9 @@ impl AppState {
 
     pub fn will_terminate(self: &Rc<Self>, _notification: &NSNotification) {
         trace_scope!("NSApplicationWillTerminateNotification");
-        // TODO: Notify every window that it will be destroyed, like done in iOS?
+        let app = NSApplication::sharedApplication(self.mtm);
+        notify_windows_of_exit(&app);
+        self.event_handler.terminate();
         self.internal_exit();
     }
 
@@ -170,10 +166,10 @@ impl AppState {
     /// of the given closure.
     pub fn set_event_handler<R>(
         &self,
-        handler: &mut dyn ApplicationHandler,
+        handler: impl ApplicationHandler,
         closure: impl FnOnce() -> R,
     ) -> R {
-        self.event_handler.set(handler, closure)
+        self.event_handler.set(Box::new(handler), closure)
     }
 
     pub fn event_loop_proxy(&self) -> &Arc<EventLoopProxy> {
@@ -208,10 +204,6 @@ impl AppState {
     /// NOTE: that if the `NSApplication` has been launched then that state is preserved,
     /// and we won't need to re-launch the app if subsequent EventLoops are run.
     pub fn internal_exit(self: &Rc<Self>) {
-        self.with_handler(|app, event_loop| {
-            app.exiting(event_loop);
-        });
-
         self.set_is_running(false);
         self.set_stop_on_redraw(false);
         self.set_stop_before_wait(false);
@@ -361,10 +353,6 @@ impl AppState {
             return;
         }
 
-        if self.event_loop_proxy.wake_up.swap(false, AtomicOrdering::Relaxed) {
-            self.with_handler(|app, event_loop| app.proxy_wake_up(event_loop));
-        }
-
         let redraw = mem::take(&mut *self.pending_redraw.borrow_mut());
         for window_id in redraw {
             self.with_handler(|app, event_loop| {
@@ -378,6 +366,7 @@ impl AppState {
         if self.exiting() {
             let app = NSApplication::sharedApplication(self.mtm);
             stop_app_immediately(&app);
+            notify_windows_of_exit(&app);
         }
 
         if self.stop_before_wait.get() {

@@ -19,6 +19,16 @@ All patches have to be sent on Github as [pull requests][prs]. To simplify your
 life during review it's recommended to check the "give contributors write access
 to the branch" checkbox.
 
+We use unstable Rustfmt options across the project, so please run
+`cargo +nightly fmt` before submitting your work. If you are unable to do so,
+the maintainers can do it for you before merging, just state so in your pull
+request description. For details on how to use nightly, consult [the
+documentation][toolchains].
+
+When editing markdown files (`.md`) they must be wrapped at 80 characters.
+
+[toolchains]: https://rust-lang.github.io/rustup/concepts/toolchains.html
+
 #### Handling review
 
 During the review process certain events could require an action from your side,

@@ -1,29 +1,23 @@
 use std::any::Any;
 use std::cell::Cell;
-use std::os::raw::c_void;
+use std::fmt;
 use std::panic::{catch_unwind, resume_unwind, RefUnwindSafe, UnwindSafe};
-use std::ptr;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use core_foundation::base::{CFIndex, CFRelease};
-use core_foundation::runloop::{
-    kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetMain, CFRunLoopSourceContext,
-    CFRunLoopSourceCreate, CFRunLoopSourceRef, CFRunLoopSourceSignal, CFRunLoopWakeUp,
-};
 use objc2::rc::{autoreleasepool, Retained};
-use objc2::{msg_send_id, sel, ClassType};
+use objc2::runtime::ProtocolObject;
+use objc2::{available, MainThreadMarker};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDidFinishLaunchingNotification,
     NSApplicationWillTerminateNotification, NSWindow,
 };
-use objc2_foundation::{MainThreadMarker, NSNotificationCenter, NSObject, NSObjectProtocol};
+use objc2_foundation::{NSNotificationCenter, NSObjectProtocol};
 use rwh_06::HasDisplayHandle;
 
 use super::super::notification_center::create_observer;
-use super::app::WinitApplication;
+use super::app::override_send_event;
 use super::app_state::AppState;
 use super::cursor::CustomCursor;
 use super::event::dummy_event;
@@ -33,18 +27,23 @@ use crate::application::ApplicationHandler;
 use crate::error::{EventLoopError, RequestError};
 use crate::event_loop::{
     ActiveEventLoop as RootActiveEventLoop, ControlFlow, DeviceEvents,
-    EventLoopProxy as CoreEventLoopProxy, EventLoopProxyProvider,
-    OwnedDisplayHandle as CoreOwnedDisplayHandle,
+    EventLoopProxy as CoreEventLoopProxy, OwnedDisplayHandle as CoreOwnedDisplayHandle,
 };
-use crate::monitor::MonitorHandle as RootMonitorHandle;
+use crate::monitor::MonitorHandle as CoreMonitorHandle;
 use crate::platform::macos::ActivationPolicy;
 use crate::platform::pump_events::PumpStatus;
 use crate::platform_impl::Window;
-use crate::window::{CustomCursor as RootCustomCursor, CustomCursorSource, Theme};
+use crate::window::{CustomCursor as CoreCustomCursor, CustomCursorSource, Theme};
 
 #[derive(Default)]
 pub struct PanicInfo {
     inner: Cell<Option<Box<dyn Any + Send + 'static>>>,
+}
+
+impl fmt::Debug for PanicInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PanicInfo").finish_non_exhaustive()
+    }
 }
 
 // WARNING:
@@ -111,17 +110,21 @@ impl RootActiveEventLoop for ActiveEventLoop {
     fn create_custom_cursor(
         &self,
         source: CustomCursorSource,
-    ) -> Result<RootCustomCursor, RequestError> {
-        Ok(RootCustomCursor { inner: CustomCursor::new(source.inner)? })
+    ) -> Result<CoreCustomCursor, RequestError> {
+        Ok(CoreCustomCursor(Arc::new(CustomCursor::new(source)?)))
     }
 
-    fn available_monitors(&self) -> Box<dyn Iterator<Item = RootMonitorHandle>> {
-        Box::new(monitor::available_monitors().into_iter().map(|inner| RootMonitorHandle { inner }))
+    fn available_monitors(&self) -> Box<dyn Iterator<Item = CoreMonitorHandle>> {
+        Box::new(
+            monitor::available_monitors()
+                .into_iter()
+                .map(|monitor| CoreMonitorHandle(Arc::new(monitor))),
+        )
     }
 
     fn primary_monitor(&self) -> Option<crate::monitor::MonitorHandle> {
         let monitor = monitor::primary_monitor();
-        Some(RootMonitorHandle { inner: monitor })
+        Some(CoreMonitorHandle(Arc::new(monitor)))
     }
 
     fn listen_device_events(&self, _allowed: DeviceEvents) {}
@@ -129,7 +132,8 @@ impl RootActiveEventLoop for ActiveEventLoop {
     fn system_theme(&self) -> Option<Theme> {
         let app = NSApplication::sharedApplication(self.mtm);
 
-        if app.respondsToSelector(sel!(effectiveAppearance)) {
+        // Dark appearance was introduced in macOS 10.14
+        if available!(macos = 10.14) {
             Some(super::window_delegate::appearance_to_theme(&app.effectiveAppearance()))
         } else {
             Some(Theme::Light)
@@ -168,6 +172,7 @@ impl rwh_06::HasDisplayHandle for ActiveEventLoop {
     }
 }
 
+#[derive(Debug)]
 pub struct EventLoop {
     /// Store a reference to the application for convenience.
     ///
@@ -183,8 +188,8 @@ pub struct EventLoop {
     // the system instead cleans it up next time it would have posted a notification to it.
     //
     // Though we do still need to keep the observers around to prevent them from being deallocated.
-    _did_finish_launching_observer: Retained<NSObject>,
-    _will_terminate_observer: Retained<NSObject>,
+    _did_finish_launching_observer: Retained<ProtocolObject<dyn NSObjectProtocol>>,
+    _will_terminate_observer: Retained<ProtocolObject<dyn NSObjectProtocol>>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -207,16 +212,6 @@ impl EventLoop {
         let mtm = MainThreadMarker::new()
             .expect("on macOS, `EventLoop` must be created on the main thread!");
 
-        let app: Retained<NSApplication> =
-            unsafe { msg_send_id![WinitApplication::class(), sharedApplication] };
-
-        if !app.is_kind_of::<WinitApplication>() {
-            panic!(
-                "`winit` requires control over the principal class. You must create the event \
-                 loop before other parts of your application initialize NSApplication"
-            );
-        }
-
         let activation_policy = match attributes.activation_policy {
             None => None,
             Some(ActivationPolicy::Regular) => Some(NSApplicationActivationPolicy::Regular),
@@ -230,6 +225,12 @@ impl EventLoop {
             attributes.default_menu,
             attributes.activate_ignoring_other_apps,
         );
+
+        // Initialize the application (if it has not already been).
+        let app = NSApplication::sharedApplication(mtm);
+
+        // Override `sendEvent:` on the application to forward to our application state.
+        override_send_event(&app);
 
         let center = unsafe { NSNotificationCenter::defaultCenter() };
 
@@ -284,10 +285,10 @@ impl EventLoop {
     // redundant wake ups.
     pub fn run_app_on_demand<A: ApplicationHandler>(
         &mut self,
-        mut app: A,
+        app: A,
     ) -> Result<(), EventLoopError> {
         self.app_state.clear_exit();
-        self.app_state.set_event_handler(&mut app, || {
+        self.app_state.set_event_handler(app, || {
             autoreleasepool(|_| {
                 // clear / normalize pump_events state
                 self.app_state.set_wait_timeout(None);
@@ -301,8 +302,8 @@ impl EventLoop {
                     self.app_state.dispatch_init_events();
                 }
 
-                // SAFETY: We do not run the application re-entrantly
-                unsafe { self.app.run() };
+                // NOTE: Make sure to not run the application re-entrantly, as that'd be confusing.
+                self.app.run();
 
                 // While the app is running it's possible that we catch a panic
                 // to avoid unwinding across an objective-c ffi boundary, which
@@ -323,9 +324,9 @@ impl EventLoop {
     pub fn pump_app_events<A: ApplicationHandler>(
         &mut self,
         timeout: Option<Duration>,
-        mut app: A,
+        app: A,
     ) -> PumpStatus {
-        self.app_state.set_event_handler(&mut app, || {
+        self.app_state.set_event_handler(app, || {
             autoreleasepool(|_| {
                 // As a special case, if the application hasn't been launched yet then we at least
                 // run the loop until it has fully launched.
@@ -333,8 +334,7 @@ impl EventLoop {
                     debug_assert!(!self.app_state.is_running());
 
                     self.app_state.set_stop_on_launch();
-                    // SAFETY: We do not run the application re-entrantly
-                    unsafe { self.app.run() };
+                    self.app.run();
 
                     // Note: we dispatch `NewEvents(Init)` + `Resumed` events after the application
                     // has launched
@@ -366,8 +366,7 @@ impl EventLoop {
                         },
                     }
                     self.app_state.set_stop_on_redraw(true);
-                    // SAFETY: We do not run the application re-entrantly
-                    unsafe { self.app.run() };
+                    self.app.run();
                 }
 
                 // While the app is running it's possible that we catch a panic
@@ -408,6 +407,22 @@ pub(super) fn stop_app_immediately(app: &NSApplication) {
     });
 }
 
+/// Tell all windows to close.
+///
+/// This will synchronously trigger `WindowEvent::Destroyed` within
+/// `windowWillClose:`, giving the application one last chance to handle
+/// those events. It doesn't matter if the user also ends up closing the
+/// windows in `Window`'s `Drop` impl, once a window has been closed once, it
+/// stays closed.
+///
+/// This ensures that no windows linger on after the event loop has exited,
+/// see <https://github.com/rust-windowing/winit/issues/4135>.
+pub(super) fn notify_windows_of_exit(app: &NSApplication) {
+    for window in app.windows() {
+        window.close();
+    }
+}
+
 /// Catches panics that happen inside `f` and when a panic
 /// happens, stops the `sharedApplication`
 #[inline]
@@ -431,64 +446,5 @@ pub fn stop_app_on_panic<F: FnOnce() -> R + UnwindSafe, R>(
             stop_app_immediately(&app);
             None
         },
-    }
-}
-
-#[derive(Debug)]
-pub struct EventLoopProxy {
-    pub(crate) wake_up: AtomicBool,
-    source: CFRunLoopSourceRef,
-}
-
-unsafe impl Send for EventLoopProxy {}
-unsafe impl Sync for EventLoopProxy {}
-
-impl Drop for EventLoopProxy {
-    fn drop(&mut self) {
-        unsafe {
-            CFRelease(self.source as _);
-        }
-    }
-}
-
-impl EventLoopProxy {
-    pub(crate) fn new() -> Self {
-        unsafe {
-            // just wake up the eventloop
-            extern "C" fn event_loop_proxy_handler(_: *const c_void) {}
-
-            // adding a Source to the main CFRunLoop lets us wake it up and
-            // process user events through the normal OS EventLoop mechanisms.
-            let rl = CFRunLoopGetMain();
-            let mut context = CFRunLoopSourceContext {
-                version: 0,
-                info: ptr::null_mut(),
-                retain: None,
-                release: None,
-                copyDescription: None,
-                equal: None,
-                hash: None,
-                schedule: None,
-                cancel: None,
-                perform: event_loop_proxy_handler,
-            };
-            let source = CFRunLoopSourceCreate(ptr::null_mut(), CFIndex::MAX - 1, &mut context);
-            CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
-            CFRunLoopWakeUp(rl);
-
-            EventLoopProxy { wake_up: AtomicBool::new(false), source }
-        }
-    }
-}
-
-impl EventLoopProxyProvider for EventLoopProxy {
-    fn wake_up(&self) {
-        self.wake_up.store(true, AtomicOrdering::Relaxed);
-        unsafe {
-            // Let the main thread know there's a new event.
-            CFRunLoopSourceSignal(self.source);
-            let rl = CFRunLoopGetMain();
-            CFRunLoopWakeUp(rl);
-        }
     }
 }

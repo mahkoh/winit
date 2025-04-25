@@ -1,8 +1,10 @@
 #![cfg(windows_platform)]
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::{self, MaybeUninit};
+use std::rc::Rc;
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::{io, panic, ptr};
@@ -35,22 +37,25 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, EnableMenuItem, FlashWindowEx, GetClientRect, GetCursorPos,
     GetForegroundWindow, GetSystemMenu, GetSystemMetrics, GetWindowPlacement, GetWindowTextLengthW,
     GetWindowTextW, IsWindowVisible, LoadCursorW, PeekMessageW, PostMessageW, RegisterClassExW,
-    SetCursor, SetCursorPos, SetForegroundWindow, SetMenuDefaultItem, SetWindowDisplayAffinity,
-    SetWindowPlacement, SetWindowPos, SetWindowTextW, TrackPopupMenu, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, FLASHWINFO, FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG, FLASHW_TRAY,
-    GWLP_HINSTANCE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP,
-    HTTOPLEFT, HTTOPRIGHT, MENU_ITEM_STATE, MFS_DISABLED, MFS_ENABLED, MF_BYCOMMAND, NID_READY,
-    PM_NOREMOVE, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, SM_DIGITIZER,
-    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, TPM_LEFTALIGN, TPM_RETURNCMD,
-    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_NCLBUTTONDOWN, WM_SYSCOMMAND, WNDCLASSEXW,
+    SendMessageW, SetCursor, SetCursorPos, SetForegroundWindow, SetMenuDefaultItem,
+    SetWindowDisplayAffinity, SetWindowPlacement, SetWindowPos, SetWindowTextW, TrackPopupMenu,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, FLASHWINFO, FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG,
+    FLASHW_TRAY, GWLP_HINSTANCE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT,
+    HTTOP, HTTOPLEFT, HTTOPRIGHT, MENU_ITEM_STATE, MFS_DISABLED, MFS_ENABLED, MF_BYCOMMAND,
+    NID_READY, PM_NOREMOVE, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE,
+    SM_DIGITIZER, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, TPM_LEFTALIGN,
+    TPM_RETURNCMD, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_NCLBUTTONDOWN, WM_SETICON, WM_SYSCOMMAND,
+    WNDCLASSEXW,
 };
 
+use super::icon::WinCursor;
+use super::MonitorHandle;
 use crate::cursor::Cursor;
 use crate::dpi::{PhysicalInsets, PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{NotSupportedError, RequestError};
-use crate::icon::Icon;
-use crate::monitor::MonitorHandle as CoreMonitorHandle;
-use crate::platform::windows::{BackdropType, Color, CornerPreference};
+use crate::icon::{Icon, RgbaIcon};
+use crate::monitor::{Fullscreen, MonitorHandle as CoreMonitorHandle, MonitorHandleProvider};
+use crate::platform::windows::{BackdropType, Color, CornerPreference, WinIcon};
 use crate::platform_impl::platform::dark_mode::try_theme;
 use crate::platform_impl::platform::definitions::{
     CLSID_TaskbarList, IID_ITaskbarList, IID_ITaskbarList2, ITaskbarList, ITaskbarList2,
@@ -59,24 +64,41 @@ use crate::platform_impl::platform::dpi::{
     dpi_to_scale_factor, enable_non_client_dpi_scaling, hwnd_dpi,
 };
 use crate::platform_impl::platform::drop_handler::FileDropHandler;
-use crate::platform_impl::platform::event_loop::{self, ActiveEventLoop, DESTROY_MSG_ID};
-use crate::platform_impl::platform::icon::{self, IconType};
+use crate::platform_impl::platform::event_loop::{
+    self, ActiveEventLoop, Event, EventLoopRunner, DESTROY_MSG_ID,
+};
+use crate::platform_impl::platform::icon::IconType;
 use crate::platform_impl::platform::ime::ImeContext;
 use crate::platform_impl::platform::keyboard::KeyEventBuilder;
 use crate::platform_impl::platform::window_state::{
     CursorFlags, SavedWindow, WindowFlags, WindowState,
 };
-use crate::platform_impl::platform::{monitor, util, Fullscreen, SelectedCursor};
+use crate::platform_impl::platform::{monitor, util, SelectedCursor};
 use crate::window::{
-    CursorGrabMode, Fullscreen as CoreFullscreen, ImePurpose, ResizeDirection, Theme,
-    UserAttentionType, Window as CoreWindow, WindowAttributes, WindowButtons, WindowId,
-    WindowLevel,
+    CursorGrabMode, ImePurpose, ResizeDirection, Theme, UserAttentionType, Window as CoreWindow,
+    WindowAttributes, WindowButtons, WindowId, WindowLevel,
 };
 
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+/// We need to pass the window handle to the event loop thread, which means it needs to be
+/// Send+Sync.
+struct SyncWindowHandle(HWND);
+
+unsafe impl Send for SyncWindowHandle {}
+unsafe impl Sync for SyncWindowHandle {}
+
+impl SyncWindowHandle {
+    fn hwnd(&self) -> HWND {
+        self.0
+    }
+}
+
 /// The Win32 implementation of the main `Window` object.
+#[derive(Debug)]
 pub(crate) struct Window {
     /// Main handle for the window.
-    window: HWND,
+    window: SyncWindowHandle,
 
     /// The current window state.
     window_state: Arc<Mutex<WindowState>>,
@@ -94,7 +116,7 @@ impl Window {
         // First person to remove the need for cloning here gets a cookie!
         //
         // done. you owe me -- ossi
-        unsafe { init(w_attr, event_loop) }
+        unsafe { init(w_attr, &event_loop.0) }
     }
 
     fn window_state_lock(&self) -> MutexGuard<'_, WindowState> {
@@ -103,7 +125,7 @@ impl Window {
 
     /// Returns the `hwnd` of this window.
     pub fn hwnd(&self) -> HWND {
-        self.window
+        self.window.hwnd()
     }
 
     pub unsafe fn rwh_06_no_thread_check(
@@ -111,7 +133,7 @@ impl Window {
     ) -> Result<rwh_06::RawWindowHandle, rwh_06::HandleError> {
         let mut window_handle = rwh_06::Win32WindowHandle::new(unsafe {
             // SAFETY: Handle will never be zero.
-            std::num::NonZeroIsize::new_unchecked(self.window)
+            std::num::NonZeroIsize::new_unchecked(self.window.hwnd() as isize)
         });
         let hinstance = unsafe { super::get_window_long(self.hwnd(), GWLP_HINSTANCE) };
         window_handle.hinstance = std::num::NonZeroIsize::new(hinstance);
@@ -150,8 +172,7 @@ impl Window {
         let window_state = Arc::clone(&self.window_state);
 
         self.thread_executor.execute_in_thread(move || {
-            let _ = &window;
-            WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
+            WindowState::set_window_flags(window_state.lock().unwrap(), window.hwnd(), |f| {
                 f.set(WindowFlags::MARKER_UNDECORATED_SHADOW, shadow)
             });
         });
@@ -169,12 +190,11 @@ impl Window {
     }
 
     pub fn set_taskbar_icon(&self, taskbar_icon: Option<Icon>) {
-        if let Some(ref taskbar_icon) = taskbar_icon {
-            taskbar_icon.inner.set_for_window(self.hwnd(), IconType::Big);
+        if let Some(taskbar_icon) = taskbar_icon {
+            self.set_icon(taskbar_icon, IconType::Big);
         } else {
-            icon::unset_for_window(self.hwnd(), IconType::Big);
+            self.unset_icon(IconType::Big);
         }
-        self.window_state_lock().taskbar_icon = taskbar_icon;
     }
 
     unsafe fn handle_os_dragging(&self, wparam: WPARAM) {
@@ -202,7 +222,7 @@ impl Window {
             unsafe { ReleaseCapture() };
 
             unsafe {
-                PostMessageW(window, WM_NCLBUTTONDOWN, wparam, &points as *const _ as LPARAM)
+                PostMessageW(window.hwnd(), WM_NCLBUTTONDOWN, wparam, &points as *const _ as LPARAM)
             };
         });
     }
@@ -227,7 +247,7 @@ impl Window {
 
             // get the current system menu
             let h_menu = GetSystemMenu(self.hwnd(), 0);
-            if h_menu == 0 {
+            if h_menu.is_null() {
                 warn!("The corresponding window doesn't have a system menu");
                 // This situation should not be treated as an error so just return without showing
                 // menu.
@@ -329,12 +349,51 @@ impl Window {
             );
         }
     }
+
+    fn set_icon(&self, mut new_icon: Icon, icon_type: IconType) {
+        if let Some(icon) = new_icon.0.cast_ref::<RgbaIcon>() {
+            let icon = match WinIcon::from_rgba(icon) {
+                Ok(icon) => icon,
+                Err(err) => {
+                    warn!("{}", err);
+                    return;
+                },
+            };
+            new_icon = Icon(Arc::new(icon));
+        }
+
+        if let Some(icon) = new_icon.0.cast_ref::<WinIcon>() {
+            unsafe {
+                SendMessageW(
+                    self.hwnd(),
+                    WM_SETICON,
+                    icon_type as usize,
+                    icon.as_raw_handle() as isize,
+                );
+            }
+
+            match icon_type {
+                IconType::Small => self.window_state_lock().window_icon = Some(new_icon),
+                IconType::Big => self.window_state_lock().taskbar_icon = Some(new_icon),
+            }
+        }
+    }
+
+    fn unset_icon(&self, icon_type: IconType) {
+        unsafe {
+            SendMessageW(self.hwnd(), WM_SETICON, icon_type as usize, 0);
+        }
+        match icon_type {
+            IconType::Small => self.window_state_lock().window_icon = None,
+            IconType::Big => self.window_state_lock().taskbar_icon = None,
+        }
+    }
 }
 
 impl Drop for Window {
     fn drop(&mut self) {
         // Restore fullscreen video mode on exit.
-        if matches!(self.fullscreen(), Some(CoreFullscreen::Exclusive(_, _))) {
+        if matches!(self.fullscreen(), Some(Fullscreen::Exclusive(_, _))) {
             self.set_fullscreen(None);
         }
 
@@ -373,7 +432,7 @@ impl CoreWindow for Window {
         let window_state = Arc::clone(&self.window_state);
         self.thread_executor.execute_in_thread(move || {
             let _ = &window;
-            WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
+            WindowState::set_window_flags(window_state.lock().unwrap(), window.hwnd(), |f| {
                 f.set(WindowFlags::TRANSPARENT, transparent)
             });
         });
@@ -386,21 +445,21 @@ impl CoreWindow for Window {
         let window_state = Arc::clone(&self.window_state);
         self.thread_executor.execute_in_thread(move || {
             let _ = &window;
-            WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
+            WindowState::set_window_flags(window_state.lock().unwrap(), window.hwnd(), |f| {
                 f.set(WindowFlags::VISIBLE, visible)
             });
         });
     }
 
     fn is_visible(&self) -> Option<bool> {
-        Some(unsafe { IsWindowVisible(self.window) == 1 })
+        Some(unsafe { IsWindowVisible(self.window.hwnd()) == 1 })
     }
 
     fn request_redraw(&self) {
         // NOTE: mark that we requested a redraw to handle requests during `WM_PAINT` handling.
         self.window_state.lock().unwrap().redraw_requested = true;
         unsafe {
-            RedrawWindow(self.hwnd(), ptr::null(), 0, RDW_INTERNALPAINT);
+            RedrawWindow(self.hwnd(), ptr::null(), ptr::null_mut(), RDW_INTERNALPAINT);
         }
     }
 
@@ -434,7 +493,7 @@ impl CoreWindow for Window {
         let window = self.window;
         self.thread_executor.execute_in_thread(move || {
             let _ = &window;
-            WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
+            WindowState::set_window_flags(window_state.lock().unwrap(), window.hwnd(), |f| {
                 f.set(WindowFlags::MAXIMIZED, false)
             });
         });
@@ -442,14 +501,14 @@ impl CoreWindow for Window {
         unsafe {
             SetWindowPos(
                 self.hwnd(),
-                0,
+                ptr::null_mut(),
                 x,
                 y,
                 0,
                 0,
                 SWP_ASYNCWINDOWPOS | SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE,
             );
-            InvalidateRgn(self.hwnd(), 0, false.into());
+            InvalidateRgn(self.hwnd(), ptr::null_mut(), false.into());
         }
     }
 
@@ -485,7 +544,7 @@ impl CoreWindow for Window {
             let window = self.window;
             self.thread_executor.execute_in_thread(move || {
                 let _ = &window;
-                WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
+                WindowState::set_window_flags(window_state.lock().unwrap(), window.hwnd(), |f| {
                     f.set(WindowFlags::MAXIMIZED, false)
                 });
             });
@@ -528,7 +587,7 @@ impl CoreWindow for Window {
 
         self.thread_executor.execute_in_thread(move || {
             let _ = &window;
-            WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
+            WindowState::set_window_flags(window_state.lock().unwrap(), window.hwnd(), |f| {
                 f.set(WindowFlags::RESIZABLE, resizable)
             });
         });
@@ -545,7 +604,7 @@ impl CoreWindow for Window {
 
         self.thread_executor.execute_in_thread(move || {
             let _ = &window;
-            WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
+            WindowState::set_window_flags(window_state.lock().unwrap(), window.hwnd(), |f| {
                 f.set(WindowFlags::MINIMIZABLE, buttons.contains(WindowButtons::MINIMIZE));
                 f.set(WindowFlags::MAXIMIZABLE, buttons.contains(WindowButtons::MAXIMIZE));
                 f.set(WindowFlags::CLOSABLE, buttons.contains(WindowButtons::CLOSE))
@@ -573,15 +632,20 @@ impl CoreWindow for Window {
             Cursor::Icon(icon) => {
                 self.window_state_lock().mouse.selected_cursor = SelectedCursor::Named(icon);
                 self.thread_executor.execute_in_thread(move || unsafe {
-                    let cursor = LoadCursorW(0, util::to_windows_cursor(icon));
+                    let cursor = LoadCursorW(ptr::null_mut(), util::to_windows_cursor(icon));
                     SetCursor(cursor);
                 });
             },
             Cursor::Custom(cursor) => {
+                let cursor = match cursor.cast_ref::<WinCursor>() {
+                    Some(cursor) => cursor,
+                    None => return,
+                };
                 self.window_state_lock().mouse.selected_cursor =
-                    SelectedCursor::Custom(cursor.inner.0.clone());
+                    SelectedCursor::Custom(cursor.0.clone());
+                let handle = cursor.0.clone();
                 self.thread_executor.execute_in_thread(move || unsafe {
-                    SetCursor(cursor.inner.0.as_raw_handle());
+                    SetCursor(handle.as_raw_handle());
                 });
             },
         }
@@ -606,7 +670,7 @@ impl CoreWindow for Window {
                 .lock()
                 .unwrap()
                 .mouse
-                .set_cursor_flags(window, |f| f.set(CursorFlags::GRABBED, confine))
+                .set_cursor_flags(window.hwnd(), |f| f.set(CursorFlags::GRABBED, confine))
                 .map_err(|err| os_error!(err).into());
             let _ = tx.send(result);
         });
@@ -625,7 +689,7 @@ impl CoreWindow for Window {
                 .lock()
                 .unwrap()
                 .mouse
-                .set_cursor_flags(window, |f| f.set(CursorFlags::HIDDEN, !visible))
+                .set_cursor_flags(window.hwnd(), |f| f.set(CursorFlags::HIDDEN, !visible))
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);
         });
@@ -687,7 +751,7 @@ impl CoreWindow for Window {
         let window = self.window;
         let window_state = Arc::clone(&self.window_state);
         self.thread_executor.execute_in_thread(move || {
-            WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
+            WindowState::set_window_flags(window_state.lock().unwrap(), window.hwnd(), |f| {
                 f.set(WindowFlags::IGNORE_CURSOR_EVENT, !hittest)
             });
         });
@@ -710,7 +774,7 @@ impl CoreWindow for Window {
             WindowState::set_window_flags_in_place(&mut window_state.lock().unwrap(), |f| {
                 f.set(WindowFlags::MINIMIZED, is_minimized)
             });
-            WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
+            WindowState::set_window_flags(window_state.lock().unwrap(), window.hwnd(), |f| {
                 f.set(WindowFlags::MINIMIZED, minimized)
             });
         });
@@ -726,7 +790,7 @@ impl CoreWindow for Window {
 
         self.thread_executor.execute_in_thread(move || {
             let _ = &window;
-            WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
+            WindowState::set_window_flags(window_state.lock().unwrap(), window.hwnd(), |f| {
                 f.set(WindowFlags::MAXIMIZED, maximized)
             });
         });
@@ -737,13 +801,12 @@ impl CoreWindow for Window {
         window_state.window_flags.contains(WindowFlags::MAXIMIZED)
     }
 
-    fn fullscreen(&self) -> Option<CoreFullscreen> {
+    fn fullscreen(&self) -> Option<Fullscreen> {
         let window_state = self.window_state_lock();
-        window_state.fullscreen.clone().map(Into::into)
+        window_state.fullscreen.clone()
     }
 
-    fn set_fullscreen(&self, fullscreen: Option<CoreFullscreen>) {
-        let fullscreen = fullscreen.map(Into::into);
+    fn set_fullscreen(&self, fullscreen: Option<Fullscreen>) {
         let window = self.window;
         let window_state = Arc::clone(&self.window_state);
 
@@ -756,7 +819,7 @@ impl CoreWindow for Window {
             // Return if saved Borderless(monitor) is the same as current monitor when requested
             // fullscreen is Borderless(None)
             (Some(Fullscreen::Borderless(Some(monitor))), Some(Fullscreen::Borderless(None)))
-                if *monitor == monitor::current_monitor(window) =>
+                if monitor.native_id() == monitor::current_monitor(window.hwnd()).native_id() =>
             {
                 return
             },
@@ -772,18 +835,19 @@ impl CoreWindow for Window {
             // fullscreen
             match (&old_fullscreen, &fullscreen) {
                 (_, Some(Fullscreen::Exclusive(monitor, video_mode))) => {
-                    let monitor_info = monitor::get_monitor_info(monitor.hmonitor()).unwrap();
+                    let monitor = monitor.cast_ref::<MonitorHandle>().unwrap();
                     let video_mode =
                         match monitor.video_mode_handles().find(|mode| &mode.mode == video_mode) {
                             Some(monitor) => monitor,
                             None => return,
                         };
+                    let monitor_info = monitor::get_monitor_info(monitor.native_id() as _).unwrap();
 
                     let res = unsafe {
                         ChangeDisplaySettingsExW(
                             monitor_info.szDevice.as_ptr(),
                             &*video_mode.native_video_mode,
-                            0,
+                            ptr::null_mut(),
                             CDS_FULLSCREEN,
                             ptr::null(),
                         )
@@ -800,7 +864,7 @@ impl CoreWindow for Window {
                         ChangeDisplaySettingsExW(
                             ptr::null(),
                             ptr::null(),
-                            0,
+                            ptr::null_mut(),
                             CDS_FULLSCREEN,
                             ptr::null(),
                         )
@@ -825,11 +889,11 @@ impl CoreWindow for Window {
                 // fine, taking control back from the DWM and ensuring that the `SetWindowPos` call
                 // below goes through.
                 let mut msg = mem::zeroed();
-                PeekMessageW(&mut msg, 0, 0, 0, PM_NOREMOVE);
+                PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_NOREMOVE);
             }
 
             // Update window style
-            WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
+            WindowState::set_window_flags(window_state.lock().unwrap(), window.hwnd(), |f| {
                 f.set(
                     WindowFlags::MARKER_EXCLUSIVE_FULLSCREEN,
                     matches!(fullscreen, Some(Fullscreen::Exclusive(_, _))),
@@ -846,7 +910,7 @@ impl CoreWindow for Window {
             // will generate WM_SIZE messages of the old window size that can race with what we set
             // below
             unsafe {
-                taskbar_mark_fullscreen(window, fullscreen.is_some());
+                taskbar_mark_fullscreen(window.hwnd(), fullscreen.is_some());
             }
 
             // Update window bounds
@@ -855,32 +919,37 @@ impl CoreWindow for Window {
                     // Save window bounds before entering fullscreen
                     let placement = unsafe {
                         let mut placement = mem::zeroed();
-                        GetWindowPlacement(window, &mut placement);
+                        GetWindowPlacement(window.hwnd(), &mut placement);
                         placement
                     };
 
                     window_state.lock().unwrap().saved_window = Some(SavedWindow { placement });
 
                     let monitor = match &fullscreen {
-                        Fullscreen::Exclusive(monitor, _) => monitor.clone(),
-                        Fullscreen::Borderless(Some(monitor)) => monitor.clone(),
-                        Fullscreen::Borderless(None) => monitor::current_monitor(window),
+                        Fullscreen::Exclusive(monitor, _)
+                        | Fullscreen::Borderless(Some(monitor)) => {
+                            Some(Cow::Borrowed(monitor.cast_ref::<MonitorHandle>().unwrap()))
+                        },
+                        Fullscreen::Borderless(None) => None,
                     };
+
+                    let monitor = monitor
+                        .unwrap_or_else(|| Cow::Owned(monitor::current_monitor(window.hwnd())));
 
                     let position: (i32, i32) = monitor.position().unwrap_or_default().into();
                     let size: (u32, u32) = monitor.size().into();
 
                     unsafe {
                         SetWindowPos(
-                            window,
-                            0,
+                            window.hwnd(),
+                            ptr::null_mut(),
                             position.0,
                             position.1,
                             size.0 as i32,
                             size.1 as i32,
                             SWP_ASYNCWINDOWPOS | SWP_NOZORDER,
                         );
-                        InvalidateRgn(window, 0, false.into());
+                        InvalidateRgn(window.hwnd(), ptr::null_mut(), false.into());
                     }
                 },
                 None => {
@@ -888,8 +957,8 @@ impl CoreWindow for Window {
                     if let Some(SavedWindow { placement }) = window_state_lock.saved_window.take() {
                         drop(window_state_lock);
                         unsafe {
-                            SetWindowPlacement(window, &placement);
-                            InvalidateRgn(window, 0, false.into());
+                            SetWindowPlacement(window.hwnd(), &placement);
+                            InvalidateRgn(window.hwnd(), ptr::null_mut(), false.into());
                         }
                     }
                 },
@@ -903,7 +972,7 @@ impl CoreWindow for Window {
 
         self.thread_executor.execute_in_thread(move || {
             let _ = &window;
-            WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
+            WindowState::set_window_flags(window_state.lock().unwrap(), window.hwnd(), |f| {
                 f.set(WindowFlags::MARKER_DECORATIONS, decorations)
             });
         });
@@ -920,7 +989,7 @@ impl CoreWindow for Window {
 
         self.thread_executor.execute_in_thread(move || {
             let _ = &window;
-            WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
+            WindowState::set_window_flags(window_state.lock().unwrap(), window.hwnd(), |f| {
                 f.set(WindowFlags::ALWAYS_ON_TOP, level == WindowLevel::AlwaysOnTop);
                 f.set(WindowFlags::ALWAYS_ON_BOTTOM, level == WindowLevel::AlwaysOnBottom);
             });
@@ -928,24 +997,27 @@ impl CoreWindow for Window {
     }
 
     fn current_monitor(&self) -> Option<CoreMonitorHandle> {
-        Some(CoreMonitorHandle { inner: monitor::current_monitor(self.hwnd()) })
+        Some(CoreMonitorHandle(Arc::new(monitor::current_monitor(self.hwnd()))))
     }
 
     fn available_monitors(&self) -> Box<dyn Iterator<Item = CoreMonitorHandle>> {
-        Box::new(monitor::available_monitors().into_iter().map(|inner| CoreMonitorHandle { inner }))
+        Box::new(
+            monitor::available_monitors()
+                .into_iter()
+                .map(|monitor| CoreMonitorHandle(Arc::new(monitor))),
+        )
     }
 
     fn primary_monitor(&self) -> Option<CoreMonitorHandle> {
-        Some(CoreMonitorHandle { inner: monitor::primary_monitor() })
+        Some(CoreMonitorHandle(Arc::new(monitor::primary_monitor())))
     }
 
     fn set_window_icon(&self, window_icon: Option<Icon>) {
-        if let Some(ref window_icon) = window_icon {
-            window_icon.inner.set_for_window(self.hwnd(), IconType::Small);
+        if let Some(window_icon) = window_icon {
+            self.set_icon(window_icon, IconType::Small);
         } else {
-            icon::unset_for_window(self.hwnd(), IconType::Small);
+            self.unset_icon(IconType::Small);
         }
-        self.window_state_lock().window_icon = window_icon;
     }
 
     fn set_ime_cursor_area(&self, spot: Position, size: Size) {
@@ -953,7 +1025,7 @@ impl CoreWindow for Window {
         let state = self.window_state.clone();
         self.thread_executor.execute_in_thread(move || unsafe {
             let scale_factor = state.lock().unwrap().scale_factor;
-            ImeContext::current(window).set_ime_cursor_area(spot, size, scale_factor);
+            ImeContext::current(window.hwnd()).set_ime_cursor_area(spot, size, scale_factor);
         });
     }
 
@@ -962,7 +1034,7 @@ impl CoreWindow for Window {
         let state = self.window_state.clone();
         self.thread_executor.execute_in_thread(move || unsafe {
             state.lock().unwrap().ime_allowed = allowed;
-            ImeContext::set_ime_allowed(window, allowed);
+            ImeContext::set_ime_allowed(window.hwnd(), allowed);
         })
     }
 
@@ -971,7 +1043,7 @@ impl CoreWindow for Window {
     fn request_user_attention(&self, request_type: Option<UserAttentionType>) {
         let window = self.window;
         let active_window_handle = unsafe { GetActiveWindow() };
-        if window == active_window_handle {
+        if window.hwnd() == active_window_handle {
             return;
         }
 
@@ -985,7 +1057,7 @@ impl CoreWindow for Window {
 
             let flash_info = FLASHWINFO {
                 cbSize: mem::size_of::<FLASHWINFO>() as u32,
-                hwnd: window,
+                hwnd: window.hwnd(),
                 dwFlags: flags,
                 uCount: count,
                 dwTimeout: 0,
@@ -995,7 +1067,7 @@ impl CoreWindow for Window {
     }
 
     fn set_theme(&self, theme: Option<Theme>) {
-        try_theme(self.window, theme);
+        try_theme(self.window.hwnd(), theme);
     }
 
     fn theme(&self) -> Option<Theme> {
@@ -1008,9 +1080,9 @@ impl CoreWindow for Window {
     }
 
     fn title(&self) -> String {
-        let len = unsafe { GetWindowTextLengthW(self.window) } + 1;
+        let len = unsafe { GetWindowTextLengthW(self.window.hwnd()) } + 1;
         let mut buf = vec![0; len as usize];
-        unsafe { GetWindowTextW(self.window, buf.as_mut_ptr(), len) };
+        unsafe { GetWindowTextW(self.window.hwnd(), buf.as_mut_ptr(), len) };
         util::decode_wide(&buf).to_string_lossy().to_string()
     }
 
@@ -1020,10 +1092,10 @@ impl CoreWindow for Window {
 
         let is_visible = window_flags.contains(WindowFlags::VISIBLE);
         let is_minimized = util::is_minimized(self.hwnd());
-        let is_foreground = self.window == unsafe { GetForegroundWindow() };
+        let is_foreground = self.window.hwnd() == unsafe { GetForegroundWindow() };
 
         if is_visible && !is_minimized && !is_foreground {
-            unsafe { force_window_active(self.window) };
+            unsafe { force_window_active(self.window.hwnd()) };
         }
     }
 
@@ -1068,7 +1140,7 @@ impl CoreWindow for Window {
 
 pub(super) struct InitData<'a> {
     // inputs
-    pub event_loop: &'a ActiveEventLoop,
+    pub runner: &'a Rc<EventLoopRunner>,
     pub attributes: WindowAttributes,
     pub window_flags: WindowFlags,
     // outputs
@@ -1111,7 +1183,11 @@ impl InitData<'_> {
 
         unsafe { ImeContext::set_ime_allowed(window, false) };
 
-        Window { window, window_state, thread_executor: self.event_loop.create_thread_executor() }
+        Window {
+            window: SyncWindowHandle(window),
+            window_state,
+            thread_executor: self.runner.create_thread_executor(),
+        }
     }
 
     unsafe fn create_window_data(&self, win: &Window) -> event_loop::WindowData {
@@ -1129,16 +1205,19 @@ impl InitData<'_> {
                 );
             }
 
-            let file_drop_runner = self.event_loop.runner_shared.clone();
+            let file_drop_runner = self.runner.clone();
+            let window_id = win.id();
             let file_drop_handler = FileDropHandler::new(
-                win.window,
-                Box::new(move |event| file_drop_runner.send_event(event)),
+                win.window.hwnd(),
+                Box::new(move |event| {
+                    file_drop_runner.send_event(Event::Window { window_id, event })
+                }),
             );
 
             let handler_interface_ptr =
                 unsafe { &mut (*file_drop_handler.data).interface as *mut _ as *mut c_void };
 
-            assert_eq!(unsafe { RegisterDragDrop(win.window, handler_interface_ptr) }, S_OK);
+            assert_eq!(unsafe { RegisterDragDrop(win.window.hwnd(), handler_interface_ptr) }, S_OK);
             Some(file_drop_handler)
         } else {
             None
@@ -1146,7 +1225,7 @@ impl InitData<'_> {
 
         event_loop::WindowData {
             window_state: win.window_state.clone(),
-            event_loop_runner: self.event_loop.runner_shared.clone(),
+            event_loop_runner: self.runner.clone(),
             key_event_builder: KeyEventBuilder::default(),
             _file_drop_handler: file_drop_handler,
             userdata_removed: Cell::new(false),
@@ -1158,7 +1237,7 @@ impl InitData<'_> {
     // The user data will be registered for the window and can be accessed within the window event
     // callback.
     pub unsafe fn on_nccreate(&mut self, window: HWND) -> Option<isize> {
-        let runner = self.event_loop.runner_shared.clone();
+        let runner = self.runner.clone();
         let result = runner.catch_unwind(|| {
             let window = unsafe { self.create_window(window) };
             let window_data = unsafe { self.create_window_data(&window) };
@@ -1250,7 +1329,7 @@ impl InitData<'_> {
 }
 unsafe fn init(
     attributes: WindowAttributes,
-    event_loop: &ActiveEventLoop,
+    runner: &Rc<EventLoopRunner>,
 ) -> Result<Window, RequestError> {
     let title = util::encode_wide(&attributes.title);
 
@@ -1304,7 +1383,7 @@ unsafe fn init(
     let menu = attributes.platform_specific.menu;
     let fullscreen = attributes.fullscreen.clone();
     let maximized = attributes.maximized;
-    let mut initdata = InitData { event_loop, attributes, window_flags, window: None };
+    let mut initdata = InitData { runner, attributes, window_flags, window: None };
 
     let (style, ex_style) = window_flags.to_window_styles();
     let handle = unsafe {
@@ -1317,19 +1396,19 @@ unsafe fn init(
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            parent.unwrap_or(0),
-            menu.unwrap_or(0),
+            parent.unwrap_or(ptr::null_mut()),
+            menu.unwrap_or(ptr::null_mut()),
             util::get_instance_handle(),
             &mut initdata as *mut _ as *mut _,
         )
     };
 
     // If the window creation in `InitData` panicked, then should resume panicking here
-    if let Err(panic_error) = event_loop.runner_shared.take_panic_error() {
+    if let Err(panic_error) = runner.take_panic_error() {
         panic::resume_unwind(panic_error)
     }
 
-    if handle == 0 {
+    if handle.is_null() {
         return Err(os_error!(io::Error::last_os_error()).into());
     }
 
@@ -1341,8 +1420,8 @@ unsafe fn init(
     // This is because if the size is changed in WM_CREATE, the restored size will be stored in that
     // size.
     if fullscreen.is_some() {
-        win.set_fullscreen(fullscreen.map(Into::into));
-        unsafe { force_window_active(win.window) };
+        win.set_fullscreen(fullscreen);
+        unsafe { force_window_active(win.window.hwnd()) };
     } else if maximized {
         win.set_maximized(true);
     }
@@ -1358,12 +1437,12 @@ unsafe fn register_window_class(class_name: &[u16]) {
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: util::get_instance_handle(),
-        hIcon: 0,
-        hCursor: 0, // must be null in order for cursor state to work properly
-        hbrBackground: 0,
+        hIcon: ptr::null_mut(),
+        hCursor: ptr::null_mut(), // must be null in order for cursor state to work properly
+        hbrBackground: ptr::null_mut(),
         lpszMenuName: ptr::null(),
         lpszClassName: class_name.as_ptr(),
-        hIconSm: 0,
+        hIconSm: ptr::null_mut(),
     };
 
     // We ignore errors because registering the same window class twice would trigger

@@ -2,9 +2,6 @@ use smol_str::SmolStr;
 
 use crate::keyboard::{Key, KeyCode, NamedKey, NativeKey, NativeKeyCode, PhysicalKey};
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub(crate) struct KeyEventExtra;
-
 impl Key {
     pub(crate) fn from_key_attribute_value(kav: &str) -> Self {
         Key::Named(match kav {
@@ -21,11 +18,13 @@ impl Key {
             "Shift" => NamedKey::Shift,
             "Symbol" => NamedKey::Symbol,
             "SymbolLock" => NamedKey::SymbolLock,
+            #[allow(deprecated)]
+            "Super" => NamedKey::Super,
+            #[allow(deprecated)]
             "Hyper" => NamedKey::Hyper,
-            "Meta" => NamedKey::Super,
+            "Meta" => NamedKey::Meta,
             "Enter" => NamedKey::Enter,
             "Tab" => NamedKey::Tab,
-            " " => NamedKey::Space,
             "ArrowDown" => NamedKey::ArrowDown,
             "ArrowLeft" => NamedKey::ArrowLeft,
             "ArrowRight" => NamedKey::ArrowRight,
@@ -381,8 +380,8 @@ impl PhysicalKey {
             "ControlLeft" => KeyCode::ControlLeft,
             "ControlRight" => KeyCode::ControlRight,
             "Enter" => KeyCode::Enter,
-            "MetaLeft" => KeyCode::SuperLeft,
-            "MetaRight" => KeyCode::SuperRight,
+            "MetaLeft" => KeyCode::MetaLeft,
+            "MetaRight" => KeyCode::MetaRight,
             "ShiftLeft" => KeyCode::ShiftLeft,
             "ShiftRight" => KeyCode::ShiftRight,
             "Space" => KeyCode::Space,
@@ -465,7 +464,11 @@ impl PhysicalKey {
             "AudioVolumeMute" => KeyCode::AudioVolumeMute,
             "AudioVolumeUp" => KeyCode::AudioVolumeUp,
             "WakeUp" => KeyCode::WakeUp,
+            #[allow(deprecated)]
+            "Super" => KeyCode::Super,
+            #[allow(deprecated)]
             "Hyper" => KeyCode::Hyper,
+            #[allow(deprecated)]
             "Turbo" => KeyCode::Turbo,
             "Abort" => KeyCode::Abort,
             "Resume" => KeyCode::Resume,

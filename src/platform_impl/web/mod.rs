@@ -32,18 +32,13 @@ mod monitor;
 mod web_sys;
 mod window;
 
-pub(crate) use cursor::{
-    CustomCursor as PlatformCustomCursor, CustomCursorFuture,
-    CustomCursorSource as PlatformCustomCursorSource,
-};
+pub(crate) use cursor::CustomCursorFuture;
 
 pub(crate) use self::event_loop::{
     ActiveEventLoop, EventLoop, PlatformSpecificEventLoopAttributes,
 };
-pub(crate) use self::keyboard::KeyEventExtra;
 pub(crate) use self::monitor::{
     HasMonitorPermissionFuture, MonitorHandle, MonitorPermissionFuture, OrientationLockFuture,
 };
 use self::web_sys as backend;
 pub use self::window::{PlatformSpecificWindowAttributes, Window};
-pub(crate) use crate::icon::NoIcon as PlatformIcon;

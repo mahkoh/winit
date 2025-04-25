@@ -1,12 +1,13 @@
 #![allow(clippy::unnecessary_cast)]
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
+use dispatch2::MainThreadBound;
 use objc2::rc::Retained;
-use objc2::{class, declare_class, msg_send, msg_send_id, mutability, ClassType, DeclaredClass};
-use objc2_foundation::{
-    CGFloat, CGPoint, CGRect, CGSize, MainThreadBound, MainThreadMarker, NSObject, NSObjectProtocol,
-};
+use objc2::{available, class, define_class, msg_send, MainThreadMarker};
+use objc2_core_foundation::{CGFloat, CGPoint, CGRect, CGSize};
+use objc2_foundation::{NSObject, NSObjectProtocol};
 use objc2_ui_kit::{
     UIApplication, UICoordinateSpace, UIEdgeInsets, UIResponder, UIScreen,
     UIScreenOverscanCompensation, UIViewController, UIWindow,
@@ -16,7 +17,7 @@ use tracing::{debug, warn};
 use super::app_state::EventWrapper;
 use super::view::WinitView;
 use super::view_controller::WinitViewController;
-use super::{app_state, monitor, ActiveEventLoop, Fullscreen, MonitorHandle};
+use super::{app_state, monitor, ActiveEventLoop, MonitorHandle};
 use crate::cursor::Cursor;
 use crate::dpi::{
     LogicalInsets, LogicalPosition, LogicalSize, PhysicalInsets, PhysicalPosition, PhysicalSize,
@@ -25,50 +26,38 @@ use crate::dpi::{
 use crate::error::{NotSupportedError, RequestError};
 use crate::event::WindowEvent;
 use crate::icon::Icon;
-use crate::monitor::MonitorHandle as CoreMonitorHandle;
+use crate::monitor::{Fullscreen, MonitorHandle as CoreMonitorHandle};
 use crate::platform::ios::{ScreenEdge, StatusBarStyle, ValidOrientations};
 use crate::window::{
     CursorGrabMode, ImePurpose, ResizeDirection, Theme, UserAttentionType, Window as CoreWindow,
     WindowAttributes, WindowButtons, WindowId, WindowLevel,
 };
 
-declare_class!(
+define_class!(
+    #[unsafe(super(UIWindow, UIResponder, NSObject))]
+    #[name = "WinitUIWindow"]
     #[derive(Debug, PartialEq, Eq, Hash)]
     pub(crate) struct WinitUIWindow;
 
-    unsafe impl ClassType for WinitUIWindow {
-        #[inherits(UIResponder, NSObject)]
-        type Super = UIWindow;
-        type Mutability = mutability::MainThreadOnly;
-        const NAME: &'static str = "WinitUIWindow";
-    }
-
-    impl DeclaredClass for WinitUIWindow {}
-
-    unsafe impl WinitUIWindow {
-        #[method(becomeKeyWindow)]
+    /// This documentation attribute makes rustfmt work for some reason?
+    impl WinitUIWindow {
+        #[unsafe(method(becomeKeyWindow))]
         fn become_key_window(&self) {
             let mtm = MainThreadMarker::new().unwrap();
-            app_state::handle_nonuser_event(
-                mtm,
-                EventWrapper::Window {
-                    window_id: self.id(),
-                    event: WindowEvent::Focused(true),
-                },
-            );
+            app_state::handle_nonuser_event(mtm, EventWrapper::Window {
+                window_id: self.id(),
+                event: WindowEvent::Focused(true),
+            });
             let _: () = unsafe { msg_send![super(self), becomeKeyWindow] };
         }
 
-        #[method(resignKeyWindow)]
+        #[unsafe(method(resignKeyWindow))]
         fn resign_key_window(&self) {
             let mtm = MainThreadMarker::new().unwrap();
-            app_state::handle_nonuser_event(
-                mtm,
-                EventWrapper::Window {
-                    window_id: self.id(),
-                    event: WindowEvent::Focused(false),
-                },
-            );
+            app_state::handle_nonuser_event(mtm, EventWrapper::Window {
+                window_id: self.id(),
+                event: WindowEvent::Focused(false),
+            });
             let _: () = unsafe { msg_send![super(self), resignKeyWindow] };
         }
     }
@@ -86,12 +75,13 @@ impl WinitUIWindow {
         // into very confusing issues with the window not being properly activated.
         //
         // Winit ensures this by not allowing access to `ActiveEventLoop` before handling events.
-        let this: Retained<Self> = unsafe { msg_send_id![mtm.alloc(), initWithFrame: frame] };
+        let this: Retained<Self> = unsafe { msg_send![mtm.alloc(), initWithFrame: frame] };
 
         this.setRootViewController(Some(view_controller));
 
-        match window_attributes.fullscreen.clone().map(Into::into) {
-            Some(Fullscreen::Exclusive(ref monitor, ref video_mode)) => {
+        match window_attributes.fullscreen.clone() {
+            Some(Fullscreen::Exclusive(monitor, ref video_mode)) => {
+                let monitor = monitor.cast_ref::<MonitorHandle>().unwrap();
                 let screen = monitor.ui_screen(mtm);
                 if let Some(video_mode) =
                     monitor.video_modes_handles().find(|mode| &mode.mode == video_mode)
@@ -101,6 +91,7 @@ impl WinitUIWindow {
                 this.setScreen(screen);
             },
             Some(Fullscreen::Borderless(Some(ref monitor))) => {
+                let monitor = monitor.cast_ref::<MonitorHandle>().unwrap();
                 let screen = monitor.ui_screen(mtm);
                 this.setScreen(screen);
             },
@@ -208,8 +199,7 @@ impl Inner {
     }
 
     pub fn safe_area(&self) -> PhysicalInsets<u32> {
-        // Only available on iOS 11.0
-        let insets = if app_state::os_capabilities().safe_area {
+        let insets = if available!(ios = 11.0, tvos = 11.0, visionos = 1.0) {
             self.view.safeAreaInsets()
         } else {
             // Assume the status bar frame is the only thing that obscures the view
@@ -316,6 +306,7 @@ impl Inner {
         let mtm = MainThreadMarker::new().unwrap();
         let uiscreen = match &monitor {
             Some(Fullscreen::Exclusive(monitor, video_mode)) => {
+                let monitor = monitor.cast_ref::<MonitorHandle>().unwrap();
                 let uiscreen = monitor.ui_screen(mtm);
                 if let Some(video_mode) =
                     monitor.video_modes_handles().find(|mode| &mode.mode == video_mode)
@@ -324,7 +315,9 @@ impl Inner {
                 }
                 uiscreen.clone()
             },
-            Some(Fullscreen::Borderless(Some(monitor))) => monitor.ui_screen(mtm).clone(),
+            Some(Fullscreen::Borderless(Some(monitor))) => {
+                monitor.cast_ref::<MonitorHandle>().unwrap().ui_screen(mtm).clone()
+            },
             Some(Fullscreen::Borderless(None)) => {
                 self.current_monitor_inner().ui_screen(mtm).clone()
             },
@@ -362,7 +355,7 @@ impl Inner {
             && screen_space_bounds.size.width == screen_bounds.size.width
             && screen_space_bounds.size.height == screen_bounds.size.height
         {
-            Some(Fullscreen::Borderless(Some(monitor)))
+            Some(Fullscreen::Borderless(Some(CoreMonitorHandle(Arc::new(monitor)))))
         } else {
             None
         }
@@ -472,6 +465,7 @@ impl Inner {
     }
 }
 
+#[derive(Debug)]
 pub struct Window {
     inner: MainThreadBound<Inner>,
 }
@@ -494,10 +488,13 @@ impl Window {
 
         #[allow(deprecated)]
         let main_screen = UIScreen::mainScreen(mtm);
-        let fullscreen = window_attributes.fullscreen.clone().map(Into::into);
+        let fullscreen = window_attributes.fullscreen.clone();
         let screen = match fullscreen {
-            Some(Fullscreen::Exclusive(ref monitor, _)) => monitor.ui_screen(mtm),
-            Some(Fullscreen::Borderless(Some(ref monitor))) => monitor.ui_screen(mtm),
+            Some(Fullscreen::Exclusive(ref monitor, _))
+            | Some(Fullscreen::Borderless(Some(ref monitor))) => {
+                let monitor = monitor.cast_ref::<MonitorHandle>().unwrap();
+                monitor.ui_screen(mtm)
+            },
             Some(Fullscreen::Borderless(None)) | None => &main_screen,
         };
 
@@ -682,12 +679,12 @@ impl CoreWindow for Window {
         self.maybe_wait_on_main(|delegate| delegate.is_maximized())
     }
 
-    fn set_fullscreen(&self, fullscreen: Option<crate::window::Fullscreen>) {
-        self.maybe_wait_on_main(|delegate| delegate.set_fullscreen(fullscreen.map(Into::into)))
+    fn set_fullscreen(&self, fullscreen: Option<Fullscreen>) {
+        self.maybe_wait_on_main(|delegate| delegate.set_fullscreen(fullscreen))
     }
 
-    fn fullscreen(&self) -> Option<crate::window::Fullscreen> {
-        self.maybe_wait_on_main(|delegate| delegate.fullscreen().map(Into::into))
+    fn fullscreen(&self) -> Option<Fullscreen> {
+        self.maybe_wait_on_main(|delegate| delegate.fullscreen())
     }
 
     fn set_decorations(&self, decorations: bool) {
@@ -783,21 +780,24 @@ impl CoreWindow for Window {
 
     fn current_monitor(&self) -> Option<CoreMonitorHandle> {
         self.maybe_wait_on_main(|delegate| {
-            delegate.current_monitor().map(|inner| CoreMonitorHandle { inner })
+            delegate.current_monitor().map(|monitor| CoreMonitorHandle(Arc::new(monitor)))
         })
     }
 
     fn available_monitors(&self) -> Box<dyn Iterator<Item = CoreMonitorHandle>> {
         self.maybe_wait_on_main(|delegate| {
             Box::new(
-                delegate.available_monitors().into_iter().map(|inner| CoreMonitorHandle { inner }),
+                delegate
+                    .available_monitors()
+                    .into_iter()
+                    .map(|monitor| CoreMonitorHandle(Arc::new(monitor))),
             )
         })
     }
 
     fn primary_monitor(&self) -> Option<CoreMonitorHandle> {
         self.maybe_wait_on_main(|delegate| {
-            delegate.primary_monitor().map(|inner| CoreMonitorHandle { inner })
+            delegate.primary_monitor().map(|monitor| CoreMonitorHandle(Arc::new(monitor)))
         })
     }
 

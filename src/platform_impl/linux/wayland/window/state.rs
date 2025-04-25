@@ -28,7 +28,7 @@ use sctk::subcompositor::SubcompositorState;
 use tracing::{info, warn};
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
 
-use crate::cursor::CustomCursor as RootCustomCursor;
+use crate::cursor::CustomCursor as CoreCustomCursor;
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalSize, Size};
 use crate::error::{NotSupportedError, RequestError};
 use crate::platform_impl::wayland::event_loop::OwnedDisplayHandle;
@@ -37,9 +37,10 @@ use crate::platform_impl::wayland::seat::{
     PointerConstraintsState, WinitPointerData, WinitPointerDataExt, ZwpTextInputV3Ext,
 };
 use crate::platform_impl::wayland::state::{WindowCompositorUpdate, WinitState};
-use crate::platform_impl::wayland::types::cursor::{CustomCursor, SelectedCursor};
+use crate::platform_impl::wayland::types::cursor::{
+    CustomCursor, SelectedCursor, WaylandCustomCursor,
+};
 use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
-use crate::platform_impl::PlatformCustomCursor;
 use crate::window::{CursorGrabMode, CursorIcon, ImePurpose, ResizeDirection, Theme, WindowId};
 
 #[cfg(feature = "sctk-adwaita")]
@@ -51,6 +52,7 @@ pub type WinitFrame = sctk::shell::xdg::fallback_frame::FallbackFrame<WinitState
 const MIN_WINDOW_SIZE: LogicalSize<u32> = LogicalSize::new(2, 1);
 
 /// The state of the window which is being updated from the [`WinitState`].
+#[derive(Debug)]
 pub struct WindowState {
     /// The connection to Wayland server.
     pub handle: Arc<OwnedDisplayHandle>,
@@ -220,9 +222,9 @@ impl WindowState {
     }
 
     /// Apply closure on the given pointer.
-    fn apply_on_pointer<F: Fn(&ThemedPointer<WinitPointerData>, &WinitPointerData)>(
+    fn apply_on_pointer<F: FnMut(&ThemedPointer<WinitPointerData>, &WinitPointerData)>(
         &self,
-        callback: F,
+        mut callback: F,
     ) {
         self.pointers.iter().filter_map(Weak::upgrade).for_each(|pointer| {
             let data = pointer.pointer().winit_data();
@@ -701,19 +703,18 @@ impl WindowState {
     }
 
     /// Set the custom cursor icon.
-    pub(crate) fn set_custom_cursor(&mut self, cursor: RootCustomCursor) {
-        let cursor = match cursor {
-            RootCustomCursor { inner: PlatformCustomCursor::Wayland(cursor) } => cursor.0,
-            #[cfg(x11_platform)]
-            RootCustomCursor { inner: PlatformCustomCursor::X(_) } => {
-                tracing::error!("passed a X11 cursor to Wayland backend");
+    pub(crate) fn set_custom_cursor(&mut self, cursor: CoreCustomCursor) {
+        let cursor = match cursor.cast_ref::<WaylandCustomCursor>() {
+            Some(cursor) => cursor,
+            None => {
+                tracing::error!("unrecognized cursor passed to Wayland backend");
                 return;
             },
         };
 
         let cursor = {
             let mut pool = self.custom_cursor_pool.lock().unwrap();
-            CustomCursor::new(&mut pool, &cursor)
+            CustomCursor::new(&mut pool, cursor)
         };
 
         if self.cursor_visible {
@@ -829,32 +830,49 @@ impl WindowState {
             },
         };
 
-        // Replace the current mode.
-        let old_mode = std::mem::replace(&mut self.cursor_grab_mode.current_grab_mode, mode);
-
-        match old_mode {
-            CursorGrabMode::None => (),
+        let mut unset_old = false;
+        match self.cursor_grab_mode.current_grab_mode {
+            CursorGrabMode::None => unset_old = true,
             CursorGrabMode::Confined => self.apply_on_pointer(|_, data| {
                 data.unconfine_pointer();
+                unset_old = true;
             }),
             CursorGrabMode::Locked => {
-                self.apply_on_pointer(|_, data| data.unlock_pointer());
+                self.apply_on_pointer(|_, data| {
+                    data.unlock_pointer();
+                    unset_old = true;
+                });
             },
         }
 
+        // In case we haven't unset the old mode, it means that we don't have a cursor above
+        // the window, thus just wait for it to re-appear.
+        if !unset_old {
+            return Ok(());
+        }
+
+        let mut set_mode = false;
         let surface = self.window.wl_surface();
         match mode {
             CursorGrabMode::Locked => self.apply_on_pointer(|pointer, data| {
                 let pointer = pointer.pointer();
-                data.lock_pointer(pointer_constraints, surface, pointer, &self.queue_handle)
+                data.lock_pointer(pointer_constraints, surface, pointer, &self.queue_handle);
+                set_mode = true;
             }),
             CursorGrabMode::Confined => self.apply_on_pointer(|pointer, data| {
                 let pointer = pointer.pointer();
-                data.confine_pointer(pointer_constraints, surface, pointer, &self.queue_handle)
+                data.confine_pointer(pointer_constraints, surface, pointer, &self.queue_handle);
+                set_mode = true;
             }),
             CursorGrabMode::None => {
                 // Current lock/confine was already removed.
+                set_mode = true;
             },
+        }
+
+        // Replace the current grab mode after we've ensure that it got updated.
+        if set_mode {
+            self.cursor_grab_mode.current_grab_mode = mode;
         }
 
         Ok(())
@@ -1097,7 +1115,7 @@ impl Drop for WindowState {
 }
 
 /// The state of the cursor grabs.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct GrabState {
     /// The grab mode requested by the user.
     user_grab_mode: CursorGrabMode,

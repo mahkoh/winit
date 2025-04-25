@@ -6,6 +6,7 @@ use std::borrow::Borrow;
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::path::Path;
+use std::sync::Arc;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -15,15 +16,16 @@ use windows_sys::Win32::Foundation::HANDLE;
 use crate::dpi::PhysicalSize;
 use crate::event::DeviceId;
 use crate::event_loop::EventLoopBuilder;
-use crate::monitor::MonitorHandle;
-use crate::window::{BadIcon, Icon, Window, WindowAttributes};
+use crate::icon::BadIcon;
+use crate::platform_impl::RaiiIcon;
+use crate::window::{Icon, Window, WindowAttributes};
 
 /// Window Handle type used by Win32 API
-pub type HWND = isize;
+pub type HWND = *mut c_void;
 /// Menu Handle type used by Win32 API
-pub type HMENU = isize;
+pub type HMENU = *mut c_void;
 /// Monitor Handle type used by Win32 API
-pub type HMONITOR = isize;
+pub type HMONITOR = *mut c_void;
 
 /// Describes a system-drawn backdrop material of a window.
 ///
@@ -344,37 +346,37 @@ pub trait WindowExtWindows {
 impl WindowExtWindows for dyn Window + '_ {
     #[inline]
     fn set_enable(&self, enabled: bool) {
-        let window = self.as_any().downcast_ref::<crate::platform_impl::Window>().unwrap();
+        let window = self.cast_ref::<crate::platform_impl::Window>().unwrap();
         window.set_enable(enabled)
     }
 
     #[inline]
     fn set_taskbar_icon(&self, taskbar_icon: Option<Icon>) {
-        let window = self.as_any().downcast_ref::<crate::platform_impl::Window>().unwrap();
+        let window = self.cast_ref::<crate::platform_impl::Window>().unwrap();
         window.set_taskbar_icon(taskbar_icon)
     }
 
     #[inline]
     fn set_skip_taskbar(&self, skip: bool) {
-        let window = self.as_any().downcast_ref::<crate::platform_impl::Window>().unwrap();
+        let window = self.cast_ref::<crate::platform_impl::Window>().unwrap();
         window.set_skip_taskbar(skip)
     }
 
     #[inline]
     fn set_undecorated_shadow(&self, shadow: bool) {
-        let window = self.as_any().downcast_ref::<crate::platform_impl::Window>().unwrap();
+        let window = self.cast_ref::<crate::platform_impl::Window>().unwrap();
         window.set_undecorated_shadow(shadow)
     }
 
     #[inline]
     fn set_system_backdrop(&self, backdrop_type: BackdropType) {
-        let window = self.as_any().downcast_ref::<crate::platform_impl::Window>().unwrap();
+        let window = self.cast_ref::<crate::platform_impl::Window>().unwrap();
         window.set_system_backdrop(backdrop_type)
     }
 
     #[inline]
     fn set_border_color(&self, color: Option<Color>) {
-        let window = self.as_any().downcast_ref::<crate::platform_impl::Window>().unwrap();
+        let window = self.cast_ref::<crate::platform_impl::Window>().unwrap();
         window.set_border_color(color.unwrap_or(Color::NONE))
     }
 
@@ -383,26 +385,26 @@ impl WindowExtWindows for dyn Window + '_ {
         // The windows docs don't mention NONE as a valid options but it works in practice and is
         // useful to circumvent the Windows option "Show accent color on title bars and
         // window borders"
-        let window = self.as_any().downcast_ref::<crate::platform_impl::Window>().unwrap();
+        let window = self.cast_ref::<crate::platform_impl::Window>().unwrap();
         window.set_title_background_color(color.unwrap_or(Color::NONE))
     }
 
     #[inline]
     fn set_title_text_color(&self, color: Color) {
-        let window = self.as_any().downcast_ref::<crate::platform_impl::Window>().unwrap();
+        let window = self.cast_ref::<crate::platform_impl::Window>().unwrap();
         window.set_title_text_color(color)
     }
 
     #[inline]
     fn set_corner_preference(&self, preference: CornerPreference) {
-        let window = self.as_any().downcast_ref::<crate::platform_impl::Window>().unwrap();
+        let window = self.cast_ref::<crate::platform_impl::Window>().unwrap();
         window.set_corner_preference(preference)
     }
 
     unsafe fn window_handle_any_thread(
         &self,
     ) -> Result<rwh_06::WindowHandle<'_>, rwh_06::HandleError> {
-        let window = self.as_any().downcast_ref::<crate::platform_impl::Window>().unwrap();
+        let window = self.cast_ref::<crate::platform_impl::Window>().unwrap();
         unsafe {
             let handle = window.rwh_06_no_thread_check()?;
 
@@ -618,27 +620,6 @@ impl WindowAttributesExtWindows for WindowAttributes {
     }
 }
 
-/// Additional methods on `MonitorHandle` that are specific to Windows.
-pub trait MonitorHandleExtWindows {
-    /// Returns the name of the monitor adapter specific to the Win32 API.
-    fn native_id(&self) -> String;
-
-    /// Returns the handle of the monitor - `HMONITOR`.
-    fn hmonitor(&self) -> HMONITOR;
-}
-
-impl MonitorHandleExtWindows for MonitorHandle {
-    #[inline]
-    fn native_id(&self) -> String {
-        self.inner.native_identifier()
-    }
-
-    #[inline]
-    fn hmonitor(&self) -> HMONITOR {
-        self.inner.hmonitor()
-    }
-}
-
 /// Additional methods on `DeviceId` that are specific to Windows.
 pub trait DeviceIdExtWindows {
     /// Returns an identifier that persistently refers to this specific device.
@@ -659,8 +640,24 @@ impl DeviceIdExtWindows for DeviceId {
     }
 }
 
-/// Additional methods on `Icon` that are specific to Windows.
-pub trait IconExtWindows: Sized {
+/// Windows specific `Icon`.
+///
+/// Windows icons can be created from files, or from the [`embedded resources`](https://learn.microsoft.com/en-us/windows/win32/menurc/about-resource-files).
+///
+/// The `ICON` resource definition statement use the following syntax:
+/// ```rc
+/// nameID ICON filename
+/// ```
+/// `nameID` is a unique name or a 16-bit unsigned integer value identifying the resource,
+/// `filename` is the name of the file that contains the resource.
+///
+/// More information about the `ICON` resource can be found at [`Microsoft Learn`](https://learn.microsoft.com/en-us/windows/win32/menurc/icon-resource) portal.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct WinIcon {
+    pub(crate) inner: Arc<RaiiIcon>,
+}
+
+impl WinIcon {
     /// Create an icon from a file path.
     ///
     /// Specify `size` to load a specific icon size from the file, or `None` to load the default
@@ -668,30 +665,88 @@ pub trait IconExtWindows: Sized {
     ///
     /// In cases where the specified size does not exist in the file, Windows may perform scaling
     /// to get an icon of the desired size.
-    fn from_path<P: AsRef<Path>>(path: P, size: Option<PhysicalSize<u32>>)
-        -> Result<Self, BadIcon>;
+    pub fn from_path<P: AsRef<Path>>(
+        path: P,
+        size: Option<PhysicalSize<u32>>,
+    ) -> Result<Self, BadIcon> {
+        Self::from_path_impl(path, size)
+    }
 
-    /// Create an icon from a resource embedded in this executable or library.
+    /// Create an icon from a resource embedded in this executable or library by its ordinal id.
+    ///
+    /// The valid `ordinal` values range from 1 to [`u16::MAX`] (inclusive). The value `0` is an
+    /// invalid ordinal id, but it can be used with [`from_resource_name`] as `"0"`.
+    ///
+    /// [`from_resource_name`]: Self::from_resource_name
     ///
     /// Specify `size` to load a specific icon size from the file, or `None` to load the default
     /// icon size from the file.
     ///
     /// In cases where the specified size does not exist in the file, Windows may perform scaling
     /// to get an icon of the desired size.
-    fn from_resource(ordinal: u16, size: Option<PhysicalSize<u32>>) -> Result<Self, BadIcon>;
-}
-
-impl IconExtWindows for Icon {
-    fn from_path<P: AsRef<Path>>(
-        path: P,
+    pub fn from_resource(
+        resource_id: u16,
         size: Option<PhysicalSize<u32>>,
     ) -> Result<Self, BadIcon> {
-        let win_icon = crate::platform_impl::WinIcon::from_path(path, size)?;
-        Ok(Icon { inner: win_icon })
+        Self::from_resource_impl(resource_id, size)
     }
 
-    fn from_resource(ordinal: u16, size: Option<PhysicalSize<u32>>) -> Result<Self, BadIcon> {
-        let win_icon = crate::platform_impl::WinIcon::from_resource(ordinal, size)?;
-        Ok(Icon { inner: win_icon })
+    /// Create an icon from a resource embedded in this executable or library by its name.
+    ///
+    /// Specify `size` to load a specific icon size from the file, or `None` to load the default
+    /// icon size from the file.
+    ///
+    /// In cases where the specified size does not exist in the file, Windows may perform scaling
+    /// to get an icon of the desired size.
+    ///
+    /// # Notes
+    ///
+    /// Consider the following resource definition statements:
+    /// ```rc
+    /// app     ICON "app.ico"
+    /// 1       ICON "a.ico"
+    /// 0027    ICON "custom.ico"
+    /// 0       ICON "alt.ico"
+    /// ```
+    ///
+    /// Due to some internal implementation details of the resource embedding/loading process on
+    /// Windows platform, strings that can be interpreted as 16-bit unsigned integers (`"1"`,
+    /// `"002"`, etc.) cannot be used as valid resource names, and instead should be passed into
+    /// [`from_resource`]:
+    ///
+    /// [`from_resource`]: Self::from_resource
+    ///
+    /// ```rust,no_run
+    /// use winit::platform::windows::WinIcon;
+    ///
+    /// assert!(WinIcon::from_resource_name("app", None).is_ok());
+    /// assert!(WinIcon::from_resource(1, None).is_ok());
+    /// assert!(WinIcon::from_resource(27, None).is_ok());
+    /// assert!(WinIcon::from_resource_name("27", None).is_err());
+    /// assert!(WinIcon::from_resource_name("0027", None).is_err());
+    /// ```
+    ///
+    /// While `0` cannot be used as an ordinal id (see [`from_resource`]), it can be used as a
+    /// name:
+    ///
+    /// [`from_resource`]: IconExtWindows::from_resource
+    ///
+    /// ```rust,no_run
+    /// # use winit::platform::windows::WinIcon;
+    /// # use winit::window::Icon;
+    /// assert!(WinIcon::from_resource_name("0", None).is_ok());
+    /// assert!(WinIcon::from_resource(0, None).is_err());
+    /// ```
+    pub fn from_resource_name(
+        resource_name: &str,
+        size: Option<PhysicalSize<u32>>,
+    ) -> Result<Self, BadIcon> {
+        Self::from_resource_name_impl(resource_name, size)
+    }
+}
+
+impl From<WinIcon> for Icon {
+    fn from(value: WinIcon) -> Self {
+        Self(Arc::new(value))
     }
 }

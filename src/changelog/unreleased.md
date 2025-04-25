@@ -71,13 +71,18 @@ changelog entry.
 - Added `Window::safe_area`, which describes the area of the surface that is unobstructed.
 - On X11, Wayland, Windows and macOS, improved scancode conversions for more obscure key codes.
 - Add ability to make non-activating window on macOS using `NSPanel` with `NSWindowStyleMask::NonactivatingPanel`.
-- `ActivationToken::from_raw` and `ActivationToken::into_raw`.
-- On X11, add a workaround for disabling IME on GNOME.
+- On Windows, add `IconExtWindows::from_resource_name`.
+- Implement `MonitorHandleProvider` for `MonitorHandle` to access common monitor API.
+- On X11, set an "area" attribute on XIM input connection to convey the cursor area.
+- Implement `CustomCursorProvider` for `CustomCursor` to access cursor API.
+- Add `CustomCursorSource::Url`, `CustomCursorSource::from_animation`.
+- Implement `CustomIconProvider` for `RgbaIcon`.
+- Add `icon` module that exposes winit's icon API.
 
 ### Changed
 
-- Change `ActiveEventLoop` to be a trait.
-- Change `Window` to be a trait.
+- Change `ActiveEventLoop` and `Window` to be traits, and added `cast_ref`/`cast_mut`/`cast`
+  methods to extract the backend type from those.
 - `ActiveEventLoop::create_window` now returns `Box<dyn Window>`.
 - `ApplicationHandler` now uses `dyn ActiveEventLoop`.
 - On Web, let events wake up event loop immediately when using `ControlFlow::Poll`.
@@ -164,7 +169,37 @@ changelog entry.
 - Update `smol_str` to version `0.3`
 - Rename `VideoModeHandle` to `VideoMode`, now it only stores plain data.
 - Make `Fullscreen::Exclusive` contain `(MonitorHandle, VideoMode)`.
-- On Wayland, no longer send an explicit clearing `Ime::Preedit` just prior to a new `Ime::Preedit`.
+- Reworked the file drag-and-drop API.
+
+  The `WindowEvent::DroppedFile`, `WindowEvent::HoveredFile` and `WindowEvent::HoveredFileCancelled`
+  events have been removed, and replaced with `WindowEvent::DragEntered`, `WindowEvent::DragMoved`,
+  `WindowEvent::DragDropped` and `WindowEvent::DragLeft`.
+
+  The old drag-and-drop events were emitted once per file. This occurred when files were *first*
+  hovered over the window, dropped, or left the window. The new drag-and-drop events are emitted
+  once per set of files dragged, and include a list of all dragged files. They also include the
+  pointer position.
+
+  The rough correspondence is:
+  - `WindowEvent::HoveredFile` -> `WindowEvent::DragEntered`
+  - `WindowEvent::DroppedFile` -> `WindowEvent::DragDropped`
+  - `WindowEvent::HoveredFileCancelled` -> `WindowEvent::DragLeft`
+
+  The `WindowEvent::DragMoved` event is entirely new, and is emitted whenever the pointer moves
+  whilst files are being dragged over the window. It doesn't contain any file paths, just the
+  pointer position.
+- Updated `objc2` to `v0.6`.
+- Updated `windows-sys` to `v0.59`.
+  - To match the corresponding changes in `windows-sys`, the `HWND`, `HMONITOR`, and `HMENU` types
+    now alias to `*mut c_void` instead of `isize`.
+- On macOS, no longer need control of the main `NSApplication` class (which means you can now override it yourself).
+- Removed `KeyEventExtModifierSupplement`, and made the fields `text_with_all_modifiers` and
+  `key_without_modifiers` public on `KeyEvent` instead.
+- Move `window::Fullscreen` to `monitor::Fullscreen`.
+- Renamed "super" key to "meta", to match the naming in the W3C specification.
+  `NamedKey::Super` still exists, but it's non-functional and deprecated, `NamedKey::Meta` should be used instead.
+- Move `IconExtWindows` into `WinIcon`.
+- On linux, use kbvm instead of xkbcommon.
 
 ### Removed
 
@@ -196,7 +231,13 @@ changelog entry.
 - Remove `WindowEvent::Touch` and `Touch` in favor of the new `PointerKind`, `PointerSource` and
  `ButtonSource` as part of the new pointer event overhaul.
 - Remove `Force::altitude_angle`.
-- Removed `Window::inner_position`, use the new `Window::surface_position` instead.
+- Remove `Window::inner_position`, use the new `Window::surface_position` instead.
+- Remove `CustomCursorExtWeb`, use the `CustomCursorSource`.
+- Remove `CustomCursor::from_rgba`, use `CustomCursorSource` instead.
+- Remove `ApplicationHandler::exited`, the event loop being shut down can now be listened to in
+  the `Drop` impl on the application handler.
+- Remove `NamedKey::Space`, match on `Key::Character(" ")` instead.
+- Remove `PartialEq` impl for `WindowAttributes`.
 
 ### Fixed
 
@@ -205,5 +246,8 @@ changelog entry.
 - On macOS, fixed the scancode conversion for audio volume keys.
 - On macOS, fixed the scancode conversion for `IntlBackslash`.
 - On macOS, fixed redundant `SurfaceResized` event at window creation.
-- On Windows, fixed the event loop not waking on accessibility requests.
-- On X11, fixed cursor grab mode state tracking on error.
+- On Windows, fixed ~500 ms pause when clicking the title bar during continuous redraw.
+- On macos, `WindowExtMacOS::set_simple_fullscreen` now honors `WindowExtMacOS::set_borderless_game`
+- On X11 and Wayland, fixed pump_events with `Some(Duration::Zero)` blocking with `Wait` polling mode
+- On macOS, fixed `run_app_on_demand` returning without closing open windows.
+- On Wayland, fixed a crash when consequently calling `set_cursor_grab` without pointer focus.

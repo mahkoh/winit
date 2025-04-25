@@ -1,10 +1,10 @@
-use std::ffi::c_void;
+use std::ptr::NonNull;
 
-use core_foundation::base::CFRelease;
-use core_foundation::data::{CFDataGetBytePtr, CFDataRef};
+use dispatch2::run_on_main;
 use objc2::rc::Retained;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventSubtype, NSEventType};
-use objc2_foundation::{run_on_main, NSPoint};
+use objc2_core_foundation::{CFData, CFRetained};
+use objc2_foundation::NSPoint;
 use smol_str::SmolStr;
 
 use super::ffi;
@@ -14,37 +14,29 @@ use crate::keyboard::{
     PhysicalKey,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct KeyEventExtra {
-    pub text_with_all_modifiers: Option<SmolStr>,
-    pub key_without_modifiers: Key,
-}
-
 /// Ignores ALL modifiers.
 pub fn get_modifierless_char(scancode: u16) -> Key {
-    let mut string = [0; 16];
-    let input_source;
-    let layout;
-    unsafe {
-        input_source = ffi::TISCopyCurrentKeyboardLayoutInputSource();
-        if input_source.is_null() {
-            tracing::error!("`TISCopyCurrentKeyboardLayoutInputSource` returned null ptr");
-            return Key::Unidentified(NativeKey::MacOS(scancode));
-        }
-        let layout_data =
-            ffi::TISGetInputSourceProperty(input_source, ffi::kTISPropertyUnicodeKeyLayoutData);
-        if layout_data.is_null() {
-            CFRelease(input_source as *mut c_void);
-            tracing::error!("`TISGetInputSourceProperty` returned null ptr");
-            return Key::Unidentified(NativeKey::MacOS(scancode));
-        }
-        layout = CFDataGetBytePtr(layout_data as CFDataRef) as *const ffi::UCKeyboardLayout;
-    }
+    let Some(ptr) = NonNull::new(unsafe { ffi::TISCopyCurrentKeyboardLayoutInputSource() }) else {
+        tracing::error!("`TISCopyCurrentKeyboardLayoutInputSource` returned null ptr");
+        return Key::Unidentified(NativeKey::MacOS(scancode));
+    };
+    let input_source = unsafe { CFRetained::from_raw(ptr) };
+
+    let layout_data = unsafe {
+        ffi::TISGetInputSourceProperty(&input_source, ffi::kTISPropertyUnicodeKeyLayoutData)
+    };
+    let Some(layout_data) = (unsafe { layout_data.cast::<CFData>().as_ref() }) else {
+        tracing::error!("`TISGetInputSourceProperty` returned null ptr");
+        return Key::Unidentified(NativeKey::MacOS(scancode));
+    };
+
+    let layout = layout_data.byte_ptr().cast();
     let keyboard_type = run_on_main(|_mtm| unsafe { ffi::LMGetKbdType() });
 
     let mut result_len = 0;
     let mut dead_keys = 0;
     let modifiers = 0;
+    let mut string = [0; 16];
     let translate_result = unsafe {
         ffi::UCKeyTranslate(
             layout,
@@ -59,9 +51,6 @@ pub fn get_modifierless_char(scancode: u16) -> Key {
             string.as_mut_ptr(),
         )
     };
-    unsafe {
-        CFRelease(input_source as *mut c_void);
-    }
     if translate_result != 0 {
         tracing::error!("`UCKeyTranslate` returned with the non-zero value: {}", translate_result);
         return Key::Unidentified(NativeKey::MacOS(scancode));
@@ -123,8 +112,8 @@ pub(crate) fn create_key_event(ns_event: &NSEvent, is_press: bool, is_repeat: bo
         let key_without_modifiers = get_modifierless_char(scancode);
 
         let modifiers = unsafe { ns_event.modifierFlags() };
-        let has_ctrl = modifiers.contains(NSEventModifierFlags::NSEventModifierFlagControl);
-        let has_cmd = modifiers.contains(NSEventModifierFlags::NSEventModifierFlagCommand);
+        let has_ctrl = modifiers.contains(NSEventModifierFlags::Control);
+        let has_cmd = modifiers.contains(NSEventModifierFlags::Command);
 
         let logical_key = match text_with_all_modifiers.as_ref() {
             // Only checking for ctrl and cmd here, not checking for alt because we DO want to
@@ -162,7 +151,8 @@ pub(crate) fn create_key_event(ns_event: &NSEvent, is_press: bool, is_repeat: bo
         repeat: is_repeat,
         state,
         text,
-        platform_specific: KeyEventExtra { text_with_all_modifiers, key_without_modifiers },
+        text_with_all_modifiers,
+        key_without_modifiers,
     }
 }
 
@@ -172,28 +162,34 @@ pub fn code_to_key(key: PhysicalKey, scancode: u16) -> Key {
         PhysicalKey::Unidentified(code) => return Key::Unidentified(code.into()),
     };
 
+    // Roughly same handling as Firefox and Chromium:
+    // https://searchfox.org/mozilla-central/rev/c597e9c789ad36af84a0370d395be066b7dc94f4/widget/NativeKeyToDOMKeyName.h
+    // https://chromium.googlesource.com/chromium/src.git/+/010a75a426c4a2292955a52f480e9251cacf750e/ui/events/keycodes/keyboard_code_conversion_mac.mm#100
     Key::Named(match code {
         KeyCode::Enter => NamedKey::Enter,
         KeyCode::Tab => NamedKey::Tab,
-        KeyCode::Space => NamedKey::Space,
+        KeyCode::Space => return Key::Character(" ".into()),
         KeyCode::Backspace => NamedKey::Backspace,
         KeyCode::Escape => NamedKey::Escape,
-        KeyCode::SuperRight => NamedKey::Super,
-        KeyCode::SuperLeft => NamedKey::Super,
+        KeyCode::MetaRight => NamedKey::Meta,
+        KeyCode::MetaLeft => NamedKey::Meta,
         KeyCode::ShiftLeft => NamedKey::Shift,
         KeyCode::AltLeft => NamedKey::Alt,
         KeyCode::ControlLeft => NamedKey::Control,
         KeyCode::ShiftRight => NamedKey::Shift,
         KeyCode::AltRight => NamedKey::Alt,
         KeyCode::ControlRight => NamedKey::Control,
+        KeyCode::CapsLock => NamedKey::CapsLock,
 
         KeyCode::NumLock => NamedKey::NumLock,
         KeyCode::AudioVolumeUp => NamedKey::AudioVolumeUp,
         KeyCode::AudioVolumeDown => NamedKey::AudioVolumeDown,
+        KeyCode::AudioVolumeMute => NamedKey::AudioVolumeMute,
 
         // Other numpad keys all generate text on macOS (if I understand correctly)
         KeyCode::NumpadEnter => NamedKey::Enter,
 
+        KeyCode::Fn => NamedKey::Fn,
         KeyCode::F1 => NamedKey::F1,
         KeyCode::F2 => NamedKey::F2,
         KeyCode::F3 => NamedKey::F3,
@@ -214,17 +210,27 @@ pub fn code_to_key(key: PhysicalKey, scancode: u16) -> Key {
         KeyCode::F18 => NamedKey::F18,
         KeyCode::F19 => NamedKey::F19,
         KeyCode::F20 => NamedKey::F20,
+        KeyCode::F21 => NamedKey::F21,
+        KeyCode::F22 => NamedKey::F22,
+        KeyCode::F23 => NamedKey::F23,
+        KeyCode::F24 => NamedKey::F24,
 
         KeyCode::Insert => NamedKey::Insert,
         KeyCode::Home => NamedKey::Home,
         KeyCode::PageUp => NamedKey::PageUp,
         KeyCode::Delete => NamedKey::Delete,
         KeyCode::End => NamedKey::End,
+        KeyCode::Help => NamedKey::Help,
         KeyCode::PageDown => NamedKey::PageDown,
         KeyCode::ArrowLeft => NamedKey::ArrowLeft,
         KeyCode::ArrowRight => NamedKey::ArrowRight,
         KeyCode::ArrowDown => NamedKey::ArrowDown,
         KeyCode::ArrowUp => NamedKey::ArrowUp,
+        KeyCode::ContextMenu => NamedKey::ContextMenu,
+
+        KeyCode::Lang2 => NamedKey::Eisu,
+        KeyCode::Lang1 => NamedKey::KanjiMode,
+
         _ => return Key::Unidentified(NativeKey::MacOS(scancode)),
     })
 }
@@ -236,8 +242,8 @@ pub fn code_to_location(key: PhysicalKey) -> KeyLocation {
     };
 
     match code {
-        KeyCode::SuperRight => KeyLocation::Right,
-        KeyCode::SuperLeft => KeyLocation::Left,
+        KeyCode::MetaRight => KeyLocation::Right,
+        KeyCode::MetaLeft => KeyLocation::Left,
         KeyCode::ShiftLeft => KeyLocation::Left,
         KeyCode::AltLeft => KeyLocation::Left,
         KeyCode::ControlLeft => KeyLocation::Left,
@@ -308,28 +314,21 @@ pub(super) fn event_mods(event: &NSEvent) -> Modifiers {
     let mut state = ModifiersState::empty();
     let mut pressed_mods = ModifiersKeys::empty();
 
-    state
-        .set(ModifiersState::SHIFT, flags.contains(NSEventModifierFlags::NSEventModifierFlagShift));
+    state.set(ModifiersState::SHIFT, flags.contains(NSEventModifierFlags::Shift));
     pressed_mods.set(ModifiersKeys::LSHIFT, flags.contains(NX_DEVICELSHIFTKEYMASK));
     pressed_mods.set(ModifiersKeys::RSHIFT, flags.contains(NX_DEVICERSHIFTKEYMASK));
 
-    state.set(
-        ModifiersState::CONTROL,
-        flags.contains(NSEventModifierFlags::NSEventModifierFlagControl),
-    );
+    state.set(ModifiersState::CONTROL, flags.contains(NSEventModifierFlags::Control));
     pressed_mods.set(ModifiersKeys::LCONTROL, flags.contains(NX_DEVICELCTLKEYMASK));
     pressed_mods.set(ModifiersKeys::RCONTROL, flags.contains(NX_DEVICERCTLKEYMASK));
 
-    state.set(ModifiersState::ALT, flags.contains(NSEventModifierFlags::NSEventModifierFlagOption));
+    state.set(ModifiersState::ALT, flags.contains(NSEventModifierFlags::Option));
     pressed_mods.set(ModifiersKeys::LALT, flags.contains(NX_DEVICELALTKEYMASK));
     pressed_mods.set(ModifiersKeys::RALT, flags.contains(NX_DEVICERALTKEYMASK));
 
-    state.set(
-        ModifiersState::SUPER,
-        flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand),
-    );
-    pressed_mods.set(ModifiersKeys::LSUPER, flags.contains(NX_DEVICELCMDKEYMASK));
-    pressed_mods.set(ModifiersKeys::RSUPER, flags.contains(NX_DEVICERCMDKEYMASK));
+    state.set(ModifiersState::META, flags.contains(NSEventModifierFlags::Command));
+    pressed_mods.set(ModifiersKeys::LMETA, flags.contains(NX_DEVICELCMDKEYMASK));
+    pressed_mods.set(ModifiersKeys::RMETA, flags.contains(NX_DEVICERCMDKEYMASK));
 
     Modifiers { state, pressed_mods }
 }
@@ -410,8 +409,8 @@ pub(crate) fn physicalkey_to_scancode(physical_key: PhysicalKey) -> Option<u32> 
         KeyCode::Backquote => Some(0x32),
         KeyCode::Backspace => Some(0x33),
         KeyCode::Escape => Some(0x35),
-        KeyCode::SuperRight => Some(0x36),
-        KeyCode::SuperLeft => Some(0x37),
+        KeyCode::MetaRight => Some(0x36),
+        KeyCode::MetaLeft => Some(0x37),
         KeyCode::ShiftLeft => Some(0x38),
         KeyCode::CapsLock => Some(0x39),
         KeyCode::AltLeft => Some(0x3a),
@@ -556,8 +555,8 @@ pub(crate) fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
         0x33 => KeyCode::Backspace,
         // 0x34 => unknown, // kVK_Powerbook_KeypadEnter
         0x35 => KeyCode::Escape,
-        0x36 => KeyCode::SuperRight,
-        0x37 => KeyCode::SuperLeft,
+        0x36 => KeyCode::MetaRight,
+        0x37 => KeyCode::MetaLeft,
         0x38 => KeyCode::ShiftLeft,
         0x39 => KeyCode::CapsLock,
         0x3a => KeyCode::AltLeft,

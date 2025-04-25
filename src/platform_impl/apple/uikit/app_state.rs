@@ -3,28 +3,23 @@
 use std::cell::{OnceCell, RefCell, RefMut};
 use std::collections::HashSet;
 use std::os::raw::c_void;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{mem, ptr};
 
-use core_foundation::base::CFRelease;
-use core_foundation::date::CFAbsoluteTimeGetCurrent;
-use core_foundation::runloop::{
-    kCFRunLoopCommonModes, CFRunLoopAddTimer, CFRunLoopGetMain, CFRunLoopRef, CFRunLoopTimerCreate,
-    CFRunLoopTimerInvalidate, CFRunLoopTimerRef, CFRunLoopTimerSetNextFireDate,
-};
+use dispatch2::MainThreadBound;
 use objc2::rc::Retained;
-use objc2::sel;
-use objc2_foundation::{
-    CGRect, CGSize, MainThreadMarker, NSInteger, NSObjectProtocol, NSOperatingSystemVersion,
-    NSProcessInfo,
+use objc2::MainThreadMarker;
+use objc2_core_foundation::{
+    kCFRunLoopCommonModes, CFAbsoluteTimeGetCurrent, CFRetained, CFRunLoop, CFRunLoopTimer, CGRect,
+    CGSize,
 };
-use objc2_ui_kit::{UIApplication, UICoordinateSpace, UIView, UIWindow};
+use objc2_ui_kit::{UIApplication, UICoordinateSpace, UIView};
 
 use super::super::event_handler::EventHandler;
+use super::super::event_loop_proxy::EventLoopProxy;
 use super::window::WinitUIWindow;
-use super::{ActiveEventLoop, EventLoopProxy};
+use super::ActiveEventLoop;
 use crate::application::ApplicationHandler;
 use crate::dpi::PhysicalSize;
 use crate::event::{StartCause, SurfaceSizeWriter, WindowEvent};
@@ -48,22 +43,10 @@ macro_rules! bug_assert {
 /// This is stored separately from AppState, since AppState needs to be accessible while the handler
 /// is executing.
 fn get_handler(mtm: MainThreadMarker) -> &'static EventHandler {
-    // TODO(madsmtm): Use `MainThreadBound` once that is possible in `static`s.
-    struct StaticMainThreadBound<T>(T);
-
-    impl<T> StaticMainThreadBound<T> {
-        const fn get(&self, _mtm: MainThreadMarker) -> &T {
-            &self.0
-        }
-    }
-
-    unsafe impl<T> Send for StaticMainThreadBound<T> {}
-    unsafe impl<T> Sync for StaticMainThreadBound<T> {}
-
     // SAFETY: Creating `StaticMainThreadBound` in a `const` context, where there is no concept
     // of the main thread.
-    static GLOBAL: StaticMainThreadBound<OnceCell<EventHandler>> =
-        StaticMainThreadBound(OnceCell::new());
+    static GLOBAL: MainThreadBound<OnceCell<EventHandler>> =
+        MainThreadBound::new(OnceCell::new(), unsafe { MainThreadMarker::new_unchecked() });
 
     GLOBAL.get(mtm).get_or_init(EventHandler::new)
 }
@@ -118,7 +101,7 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn get_mut(_mtm: MainThreadMarker) -> RefMut<'static, AppState> {
+    pub(crate) fn get_mut(mtm: MainThreadMarker) -> RefMut<'static, AppState> {
         // basically everything in UIKit requires the main thread, so it's pointless to use the
         // std::sync APIs.
         // must be mut because plain `static` requires `Sync`
@@ -130,17 +113,21 @@ impl AppState {
         if guard.is_none() {
             #[inline(never)]
             #[cold]
-            fn init_guard(guard: &mut RefMut<'static, Option<AppState>>) {
-                let waker = EventLoopWaker::new(unsafe { CFRunLoopGetMain() });
+            fn init_guard(guard: &mut RefMut<'static, Option<AppState>>, mtm: MainThreadMarker) {
+                let waker = EventLoopWaker::new(CFRunLoop::main().unwrap());
+                let event_loop_proxy = Arc::new(EventLoopProxy::new(mtm, move || {
+                    get_handler(mtm).handle(|app| app.proxy_wake_up(&ActiveEventLoop { mtm }));
+                }));
+
                 **guard = Some(AppState {
                     app_state: Some(AppStateImpl::Initial { queued_gpu_redraws: HashSet::new() }),
                     control_flow: ControlFlow::default(),
                     waker,
-                    event_loop_proxy: Arc::new(EventLoopProxy::new()),
+                    event_loop_proxy,
                     queued_events: Vec::new(),
                 });
             }
-            init_guard(&mut guard);
+            init_guard(&mut guard, mtm);
         }
         RefMut::map(guard, |state| state.as_mut().unwrap())
     }
@@ -255,6 +242,7 @@ impl AppState {
             (ControlFlow::Wait, ControlFlow::Wait) => {
                 let start = Instant::now();
                 self.set_state(AppStateImpl::Waiting { start });
+                self.waker.stop()
             },
             (ControlFlow::WaitUntil(old_instant), ControlFlow::WaitUntil(new_instant))
                 if old_instant == new_instant =>
@@ -309,15 +297,19 @@ pub(crate) fn queue_gl_or_metal_redraw(mtm: MainThreadMarker, window: Retained<W
         },
         s @ &mut AppStateImpl::ProcessingRedraws { .. }
         | s @ &mut AppStateImpl::Waiting { .. }
-        | s @ &mut AppStateImpl::PollFinished { .. } => bug!("unexpected state {:?}", s),
+        | s @ &mut AppStateImpl::PollFinished => bug!("unexpected state {:?}", s),
         &mut AppStateImpl::Terminated => {
             panic!("Attempt to create a `Window` after the app has terminated")
         },
     }
 }
 
-pub(crate) fn launch(mtm: MainThreadMarker, app: &mut dyn ApplicationHandler, run: impl FnOnce()) {
-    get_handler(mtm).set(app, run)
+pub(crate) fn launch<R>(
+    mtm: MainThreadMarker,
+    app: impl ApplicationHandler,
+    run: impl FnOnce() -> R,
+) -> R {
+    get_handler(mtm).set(Box::new(app), run)
 }
 
 pub fn did_finish_launching(mtm: MainThreadMarker) {
@@ -409,12 +401,7 @@ fn handle_user_events(mtm: MainThreadMarker) {
     if matches!(this.state(), AppStateImpl::ProcessingRedraws { .. }) {
         bug!("user events attempted to be sent out while `ProcessingRedraws`");
     }
-    let event_loop_proxy = this.event_loop_proxy().clone();
     drop(this);
-
-    if event_loop_proxy.wake_up.swap(false, Ordering::Relaxed) {
-        get_handler(mtm).handle(|app| app.proxy_wake_up(&ActiveEventLoop { mtm }));
-    }
 
     loop {
         let mut this = AppState::get_mut(mtm);
@@ -427,10 +414,6 @@ fn handle_user_events(mtm: MainThreadMarker) {
         for event in queued_events {
             handle_wrapped_event(mtm, event);
         }
-
-        if event_loop_proxy.wake_up.swap(false, Ordering::Relaxed) {
-            get_handler(mtm).handle(|app| app.proxy_wake_up(&ActiveEventLoop { mtm }));
-        }
     }
 }
 
@@ -440,13 +423,7 @@ pub(crate) fn send_occluded_event_for_all_windows(application: &UIApplication, o
     let mut events = Vec::new();
     #[allow(deprecated)]
     for window in application.windows().iter() {
-        if window.is_kind_of::<WinitUIWindow>() {
-            // SAFETY: We just checked that the window is a `winit` window
-            let window = unsafe {
-                let ptr: *const UIWindow = window;
-                let ptr: *const WinitUIWindow = ptr.cast();
-                &*ptr
-            };
+        if let Ok(window) = window.downcast::<WinitUIWindow>() {
             events.push(EventWrapper::Window {
                 window_id: window.id(),
                 event: WindowEvent::Occluded(occluded),
@@ -510,13 +487,7 @@ pub(crate) fn terminated(application: &UIApplication) {
     let mut events = Vec::new();
     #[allow(deprecated)]
     for window in application.windows().iter() {
-        if window.is_kind_of::<WinitUIWindow>() {
-            // SAFETY: We just checked that the window is a `winit` window
-            let window = unsafe {
-                let ptr: *const UIWindow = window;
-                let ptr: *const WinitUIWindow = ptr.cast();
-                &*ptr
-            };
+        if let Ok(window) = window.downcast::<WinitUIWindow>() {
             events.push(EventWrapper::Window {
                 window_id: window.id(),
                 event: WindowEvent::Destroyed,
@@ -527,9 +498,11 @@ pub(crate) fn terminated(application: &UIApplication) {
 
     let mut this = AppState::get_mut(mtm);
     this.terminated_transition();
+    // Prevent EventLoopProxy from firing again.
+    this.event_loop_proxy.invalidate();
     drop(this);
 
-    get_handler(mtm).handle(|app| app.exiting(&ActiveEventLoop { mtm }));
+    get_handler(mtm).terminate();
 }
 
 fn handle_wrapped_event(mtm: MainThreadMarker, event: EventWrapper) {
@@ -569,46 +542,44 @@ fn get_view_and_screen_frame(window: &WinitUIWindow) -> (Retained<UIView>, CGRec
 }
 
 struct EventLoopWaker {
-    timer: CFRunLoopTimerRef,
+    timer: CFRetained<CFRunLoopTimer>,
 }
 
 impl Drop for EventLoopWaker {
     fn drop(&mut self) {
-        unsafe {
-            CFRunLoopTimerInvalidate(self.timer);
-            CFRelease(self.timer as _);
-        }
+        self.timer.invalidate();
     }
 }
 
 impl EventLoopWaker {
-    fn new(rl: CFRunLoopRef) -> EventLoopWaker {
-        extern "C" fn wakeup_main_loop(_timer: CFRunLoopTimerRef, _info: *mut c_void) {}
+    fn new(rl: CFRetained<CFRunLoop>) -> EventLoopWaker {
+        extern "C-unwind" fn wakeup_main_loop(_timer: *mut CFRunLoopTimer, _info: *mut c_void) {}
         unsafe {
             // Create a timer with a 0.1µs interval (1ns does not work) to mimic polling.
             // It is initially setup with a first fire time really far into the
             // future, but that gets changed to fire immediately in did_finish_launching
-            let timer = CFRunLoopTimerCreate(
-                ptr::null_mut(),
+            let timer = CFRunLoopTimer::new(
+                None,
                 f64::MAX,
                 0.000_000_1,
                 0,
                 0,
-                wakeup_main_loop,
+                Some(wakeup_main_loop),
                 ptr::null_mut(),
-            );
-            CFRunLoopAddTimer(rl, timer, kCFRunLoopCommonModes);
+            )
+            .unwrap();
+            rl.add_timer(Some(&timer), kCFRunLoopCommonModes);
 
             EventLoopWaker { timer }
         }
     }
 
     fn stop(&mut self) {
-        unsafe { CFRunLoopTimerSetNextFireDate(self.timer, f64::MAX) }
+        self.timer.set_next_fire_date(f64::MAX);
     }
 
     fn start(&mut self) {
-        unsafe { CFRunLoopTimerSetNextFireDate(self.timer, f64::MIN) }
+        self.timer.set_next_fire_date(f64::MIN);
     }
 
     fn start_at(&mut self, instant: Instant) {
@@ -616,99 +587,11 @@ impl EventLoopWaker {
         if now >= instant {
             self.start();
         } else {
-            unsafe {
-                let current = CFAbsoluteTimeGetCurrent();
-                let duration = instant - now;
-                let fsecs =
-                    duration.subsec_nanos() as f64 / 1_000_000_000.0 + duration.as_secs() as f64;
-                CFRunLoopTimerSetNextFireDate(self.timer, current + fsecs)
-            }
+            let current = CFAbsoluteTimeGetCurrent();
+            let duration = instant - now;
+            let fsecs =
+                duration.subsec_nanos() as f64 / 1_000_000_000.0 + duration.as_secs() as f64;
+            self.timer.set_next_fire_date(current + fsecs);
         }
     }
-}
-
-macro_rules! os_capabilities {
-    (
-        $(
-            $(#[$attr:meta])*
-            $error_name:ident: $objc_call:literal,
-            $name:ident: $major:literal-$minor:literal
-        ),*
-        $(,)*
-    ) => {
-        #[derive(Clone, Debug)]
-        pub struct OSCapabilities {
-            $(
-                pub $name: bool,
-            )*
-
-            os_version: NSOperatingSystemVersion,
-        }
-
-        impl OSCapabilities {
-            fn from_os_version(os_version: NSOperatingSystemVersion) -> Self {
-                $(let $name = meets_requirements(os_version, $major, $minor);)*
-                Self { $($name,)* os_version, }
-            }
-        }
-
-        impl OSCapabilities {$(
-            $(#[$attr])*
-            pub fn $error_name(&self, extra_msg: &str) {
-                tracing::warn!(
-                    concat!("`", $objc_call, "` requires iOS {}.{}+. This device is running iOS {}.{}.{}. {}"),
-                    $major, $minor, self.os_version.majorVersion, self.os_version.minorVersion, self.os_version.patchVersion,
-                    extra_msg
-                )
-            }
-        )*}
-    };
-}
-
-os_capabilities! {
-    /// <https://developer.apple.com/documentation/uikit/uiview/2891103-safeareainsets?language=objc>
-    #[allow(unused)] // error message unused
-    safe_area_err_msg: "-[UIView safeAreaInsets]",
-    safe_area: 11-0,
-    /// <https://developer.apple.com/documentation/uikit/uiviewcontroller/2887509-setneedsupdateofhomeindicatoraut?language=objc>
-    home_indicator_hidden_err_msg: "-[UIViewController setNeedsUpdateOfHomeIndicatorAutoHidden]",
-    home_indicator_hidden: 11-0,
-    /// <https://developer.apple.com/documentation/uikit/uiviewcontroller/2887507-setneedsupdateofscreenedgesdefer?language=objc>
-    defer_system_gestures_err_msg: "-[UIViewController setNeedsUpdateOfScreenEdgesDeferringSystem]",
-    defer_system_gestures: 11-0,
-    /// <https://developer.apple.com/documentation/uikit/uiscreen/2806814-maximumframespersecond?language=objc>
-    maximum_frames_per_second_err_msg: "-[UIScreen maximumFramesPerSecond]",
-    maximum_frames_per_second: 10-3,
-    /// <https://developer.apple.com/documentation/uikit/uitouch/1618110-force?language=objc>
-    #[allow(unused)] // error message unused
-    force_touch_err_msg: "-[UITouch force]",
-    force_touch: 9-0,
-}
-
-fn meets_requirements(
-    version: NSOperatingSystemVersion,
-    required_major: NSInteger,
-    required_minor: NSInteger,
-) -> bool {
-    (version.majorVersion, version.minorVersion) >= (required_major, required_minor)
-}
-
-fn get_version() -> NSOperatingSystemVersion {
-    let process_info = NSProcessInfo::processInfo();
-    let atleast_ios_8 = process_info.respondsToSelector(sel!(operatingSystemVersion));
-    // Winit requires atleast iOS 8 because no one has put the time into supporting earlier os
-    // versions. Older iOS versions are increasingly difficult to test. For example, Xcode 11 does
-    // not support debugging on devices with an iOS version of less than 8. Another example, in
-    // order to use an iOS simulator older than iOS 8, you must download an older version of Xcode
-    // (<9), and at least Xcode 7 has been tested to not even run on macOS 10.15 - Xcode 8 might?
-    //
-    // The minimum required iOS version is likely to grow in the future.
-    assert!(atleast_ios_8, "`winit` requires iOS version 8 or greater");
-    process_info.operatingSystemVersion()
-}
-
-pub fn os_capabilities() -> OSCapabilities {
-    // Cache the version lookup for efficiency
-    static OS_CAPABILITIES: OnceLock<OSCapabilities> = OnceLock::new();
-    OS_CAPABILITIES.get_or_init(|| OSCapabilities::from_os_version(get_version())).clone()
 }

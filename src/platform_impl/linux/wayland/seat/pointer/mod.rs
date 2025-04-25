@@ -27,7 +27,10 @@ use sctk::seat::pointer::{
 use sctk::seat::SeatState;
 
 use crate::dpi::{LogicalPosition, PhysicalPosition};
-use crate::event::{ElementState, MouseButton, MouseScrollDelta, PointerSource, PointerKind, TouchPhase, WindowEvent};
+use crate::event::{
+    ElementState, MouseButton, MouseScrollDelta, PointerKind, PointerSource, TouchPhase,
+    WindowEvent,
+};
 
 use crate::platform_impl::wayland::state::WinitState;
 use crate::platform_impl::wayland::{self, WindowId};
@@ -411,6 +414,7 @@ impl WinitPointerDataExt for WlPointer {
     }
 }
 
+#[derive(Debug)]
 pub struct PointerConstraintsState {
     pointer_constraints: ZwpPointerConstraintsV1,
 }

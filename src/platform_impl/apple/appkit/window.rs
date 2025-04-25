@@ -1,20 +1,24 @@
 #![allow(clippy::unnecessary_cast)]
 
+use std::sync::Arc;
+
+use dispatch2::MainThreadBound;
 use dpi::{Position, Size};
 use objc2::rc::{autoreleasepool, Retained};
-use objc2::{declare_class, mutability, ClassType, DeclaredClass};
+use objc2::{define_class, MainThreadMarker, Message};
 use objc2_app_kit::{NSPanel, NSResponder, NSWindow};
-use objc2_foundation::{MainThreadBound, MainThreadMarker, NSObject};
+use objc2_foundation::NSObject;
 
 use super::event_loop::ActiveEventLoop;
 use super::window_delegate::WindowDelegate;
 use crate::error::RequestError;
-use crate::monitor::MonitorHandle as CoreMonitorHandle;
+use crate::monitor::{Fullscreen, MonitorHandle as CoreMonitorHandle};
 use crate::window::{
-    Cursor, Fullscreen, Icon, ImePurpose, Theme, UserAttentionType, Window as CoreWindow,
-    WindowAttributes, WindowButtons, WindowId, WindowLevel,
+    Cursor, Icon, ImePurpose, Theme, UserAttentionType, Window as CoreWindow, WindowAttributes,
+    WindowButtons, WindowId, WindowLevel,
 };
 
+#[derive(Debug)]
 pub(crate) struct Window {
     window: MainThreadBound<Retained<NSWindow>>,
     /// The window only keeps a weak reference to this, so we must keep it around here.
@@ -204,11 +208,11 @@ impl CoreWindow for Window {
     }
 
     fn set_fullscreen(&self, fullscreen: Option<Fullscreen>) {
-        self.maybe_wait_on_main(|delegate| delegate.set_fullscreen(fullscreen.map(Into::into)))
+        self.maybe_wait_on_main(|delegate| delegate.set_fullscreen(fullscreen))
     }
 
     fn fullscreen(&self) -> Option<Fullscreen> {
-        self.maybe_wait_on_main(|delegate| delegate.fullscreen().map(Into::into))
+        self.maybe_wait_on_main(|delegate| delegate.fullscreen())
     }
 
     fn set_decorations(&self, decorations: bool) {
@@ -305,21 +309,24 @@ impl CoreWindow for Window {
 
     fn current_monitor(&self) -> Option<CoreMonitorHandle> {
         self.maybe_wait_on_main(|delegate| {
-            delegate.current_monitor().map(|inner| CoreMonitorHandle { inner })
+            delegate.current_monitor().map(|monitor| CoreMonitorHandle(Arc::new(monitor)))
         })
     }
 
     fn available_monitors(&self) -> Box<dyn Iterator<Item = CoreMonitorHandle>> {
         self.maybe_wait_on_main(|delegate| {
             Box::new(
-                delegate.available_monitors().into_iter().map(|inner| CoreMonitorHandle { inner }),
+                delegate
+                    .available_monitors()
+                    .into_iter()
+                    .map(|monitor| CoreMonitorHandle(Arc::new(monitor))),
             )
         })
     }
 
     fn primary_monitor(&self) -> Option<CoreMonitorHandle> {
         self.maybe_wait_on_main(|delegate| {
-            delegate.primary_monitor().map(|inner| CoreMonitorHandle { inner })
+            delegate.primary_monitor().map(|monitor| CoreMonitorHandle(Arc::new(monitor)))
         })
     }
 
@@ -332,27 +339,21 @@ impl CoreWindow for Window {
     }
 }
 
-declare_class!(
+define_class!(
+    #[unsafe(super(NSWindow, NSResponder, NSObject))]
+    #[name = "WinitWindow"]
     #[derive(Debug)]
     pub struct WinitWindow;
 
-    unsafe impl ClassType for WinitWindow {
-        #[inherits(NSResponder, NSObject)]
-        type Super = NSWindow;
-        type Mutability = mutability::MainThreadOnly;
-        const NAME: &'static str = "WinitWindow";
-    }
-
-    impl DeclaredClass for WinitWindow {}
-
-    unsafe impl WinitWindow {
-        #[method(canBecomeMainWindow)]
+    /// This documentation attribute makes rustfmt work for some reason?
+    impl WinitWindow {
+        #[unsafe(method(canBecomeMainWindow))]
         fn can_become_main_window(&self) -> bool {
             trace_scope!("canBecomeMainWindow");
             true
         }
 
-        #[method(canBecomeKeyWindow)]
+        #[unsafe(method(canBecomeKeyWindow))]
         fn can_become_key_window(&self) -> bool {
             trace_scope!("canBecomeKeyWindow");
             true
@@ -360,23 +361,17 @@ declare_class!(
     }
 );
 
-declare_class!(
+define_class!(
+    #[unsafe(super(NSPanel, NSWindow, NSResponder, NSObject))]
+    #[name = "WinitPanel"]
     #[derive(Debug)]
     pub struct WinitPanel;
 
-    unsafe impl ClassType for WinitPanel {
-        #[inherits(NSWindow, NSResponder, NSObject)]
-        type Super = NSPanel;
-        type Mutability = mutability::MainThreadOnly;
-        const NAME: &'static str = "WinitPanel";
-    }
-
-    impl DeclaredClass for WinitPanel {}
-
-    unsafe impl WinitPanel {
+    /// This documentation attribute makes rustfmt work for some reason?
+    impl WinitPanel {
         // although NSPanel can become key window
         // it doesn't if window doesn't have NSWindowStyleMask::Titled
-        #[method(canBecomeKeyWindow)]
+        #[unsafe(method(canBecomeKeyWindow))]
         fn can_become_key_window(&self) -> bool {
             trace_scope!("canBecomeKeyWindow");
             true

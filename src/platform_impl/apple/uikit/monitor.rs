@@ -4,27 +4,26 @@ use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::{fmt, hash, ptr};
 
-use objc2::mutability::IsRetainable;
+use dispatch2::{run_on_main, MainThreadBound};
 use objc2::rc::Retained;
-use objc2::Message;
-use objc2_foundation::{run_on_main, MainThreadBound, MainThreadMarker, NSInteger};
+use objc2::{available, MainThreadMarker, Message};
+use objc2_foundation::NSInteger;
 use objc2_ui_kit::{UIScreen, UIScreenMode};
 
-use super::app_state;
 use crate::dpi::PhysicalPosition;
-use crate::monitor::VideoMode;
+use crate::monitor::{MonitorHandleProvider, VideoMode};
 
 // Workaround for `MainThreadBound` implementing almost no traits
 #[derive(Debug)]
 struct MainThreadBoundDelegateImpls<T>(MainThreadBound<Retained<T>>);
 
-impl<T: IsRetainable + Message> Clone for MainThreadBoundDelegateImpls<T> {
+impl<T: Message> Clone for MainThreadBoundDelegateImpls<T> {
     fn clone(&self) -> Self {
         Self(run_on_main(|mtm| MainThreadBound::new(Retained::clone(self.0.get(mtm)), mtm)))
     }
 }
 
-impl<T: IsRetainable + Message> hash::Hash for MainThreadBoundDelegateImpls<T> {
+impl<T: Message> hash::Hash for MainThreadBoundDelegateImpls<T> {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
         // SAFETY: Marker only used to get the pointer
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
@@ -32,7 +31,7 @@ impl<T: IsRetainable + Message> hash::Hash for MainThreadBoundDelegateImpls<T> {
     }
 }
 
-impl<T: IsRetainable + Message> PartialEq for MainThreadBoundDelegateImpls<T> {
+impl<T: Message> PartialEq for MainThreadBoundDelegateImpls<T> {
     fn eq(&self, other: &Self) -> bool {
         // SAFETY: Marker only used to get the pointer
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
@@ -40,7 +39,7 @@ impl<T: IsRetainable + Message> PartialEq for MainThreadBoundDelegateImpls<T> {
     }
 }
 
-impl<T: IsRetainable + Message> Eq for MainThreadBoundDelegateImpls<T> {}
+impl<T: Message> Eq for MainThreadBoundDelegateImpls<T> {}
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct VideoModeHandle {
@@ -75,6 +74,60 @@ impl VideoModeHandle {
 
 pub struct MonitorHandle {
     ui_screen: MainThreadBound<Retained<UIScreen>>,
+}
+
+impl MonitorHandleProvider for MonitorHandle {
+    fn id(&self) -> u128 {
+        self.native_id() as _
+    }
+
+    fn native_id(&self) -> u64 {
+        // SAFETY: Only getting the pointer.
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        Retained::as_ptr(self.ui_screen.get(mtm)) as u64
+    }
+
+    fn name(&self) -> Option<std::borrow::Cow<'_, str>> {
+        run_on_main(|mtm| {
+            #[allow(deprecated)]
+            let main = UIScreen::mainScreen(mtm);
+            if *self.ui_screen(mtm) == main {
+                Some("Primary".into())
+            } else if Some(self.ui_screen(mtm)) == main.mirroredScreen().as_ref() {
+                Some("Mirrored".into())
+            } else {
+                #[allow(deprecated)]
+                UIScreen::screens(mtm)
+                    .iter()
+                    .position(|rhs| rhs == *self.ui_screen(mtm))
+                    .map(|idx| idx.to_string().into())
+            }
+        })
+    }
+
+    fn position(&self) -> Option<PhysicalPosition<i32>> {
+        let bounds = self.ui_screen.get_on_main(|ui_screen| ui_screen.nativeBounds());
+        Some((bounds.origin.x as f64, bounds.origin.y as f64).into())
+    }
+
+    fn scale_factor(&self) -> f64 {
+        self.ui_screen.get_on_main(|ui_screen| ui_screen.nativeScale()) as f64
+    }
+
+    fn current_video_mode(&self) -> Option<VideoMode> {
+        Some(run_on_main(|mtm| {
+            VideoModeHandle::new(
+                self.ui_screen(mtm).clone(),
+                self.ui_screen(mtm).currentMode().unwrap(),
+                mtm,
+            )
+            .mode
+        }))
+    }
+
+    fn video_modes(&self) -> Box<dyn Iterator<Item = VideoMode>> {
+        Box::new(self.video_modes())
+    }
 }
 
 impl Clone for MonitorHandle {
@@ -138,44 +191,6 @@ impl MonitorHandle {
         Self { ui_screen: MainThreadBound::new(ui_screen, mtm) }
     }
 
-    pub fn name(&self) -> Option<String> {
-        run_on_main(|mtm| {
-            #[allow(deprecated)]
-            let main = UIScreen::mainScreen(mtm);
-            if *self.ui_screen(mtm) == main {
-                Some("Primary".to_string())
-            } else if Some(self.ui_screen(mtm)) == main.mirroredScreen().as_ref() {
-                Some("Mirrored".to_string())
-            } else {
-                #[allow(deprecated)]
-                UIScreen::screens(mtm)
-                    .iter()
-                    .position(|rhs| rhs == &**self.ui_screen(mtm))
-                    .map(|idx| idx.to_string())
-            }
-        })
-    }
-
-    pub fn position(&self) -> Option<PhysicalPosition<i32>> {
-        let bounds = self.ui_screen.get_on_main(|ui_screen| ui_screen.nativeBounds());
-        Some((bounds.origin.x as f64, bounds.origin.y as f64).into())
-    }
-
-    pub fn scale_factor(&self) -> f64 {
-        self.ui_screen.get_on_main(|ui_screen| ui_screen.nativeScale()) as f64
-    }
-
-    pub fn current_video_mode(&self) -> Option<VideoMode> {
-        Some(run_on_main(|mtm| {
-            VideoModeHandle::new(
-                self.ui_screen(mtm).clone(),
-                self.ui_screen(mtm).currentMode().unwrap(),
-                mtm,
-            )
-            .mode
-        }))
-    }
-
     pub fn video_modes_handles(&self) -> impl Iterator<Item = VideoModeHandle> {
         run_on_main(|mtm| {
             let ui_screen = self.ui_screen(mtm);
@@ -211,8 +226,7 @@ impl MonitorHandle {
 
 fn refresh_rate_millihertz(uiscreen: &UIScreen) -> Option<NonZeroU32> {
     let refresh_rate_millihertz: NSInteger = {
-        let os_capabilities = app_state::os_capabilities();
-        if os_capabilities.maximum_frames_per_second {
+        if available!(ios = 10.3, tvos = 10.2) {
             uiscreen.maximumFramesPerSecond()
         } else {
             // https://developer.apple.com/library/archive/technotes/tn2460/_index.html
@@ -225,7 +239,9 @@ fn refresh_rate_millihertz(uiscreen: &UIScreen) -> Option<NonZeroU32> {
             //
             // FIXME: earlier OSs could calculate the refresh rate using
             // `-[CADisplayLink duration]`.
-            os_capabilities.maximum_frames_per_second_err_msg("defaulting to 60 fps");
+            tracing::warn!(
+                "`maximumFramesPerSecond` requires iOS 10.3+ or tvOS 10.2+. Defaulting to 60 fps"
+            );
             60
         }
     };
@@ -254,7 +270,7 @@ mod tests {
         assert!(ptr::eq(&*UIScreen::mainScreen(mtm), &*UIScreen::mainScreen(mtm)));
 
         let main = UIScreen::mainScreen(mtm);
-        assert!(UIScreen::screens(mtm).iter().any(|screen| ptr::eq(screen, &*main)));
+        assert!(UIScreen::screens(mtm).iter().any(|screen| ptr::eq(&*screen, &*main)));
 
         assert!(unsafe {
             NSSet::setWithArray(&UIScreen::screens(mtm)).containsObject(&UIScreen::mainScreen(mtm))

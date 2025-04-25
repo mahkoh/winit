@@ -7,18 +7,19 @@ use std::sync::Mutex;
 use smol_str::SmolStr;
 use windows_sys::Win32::System::SystemServices::{LANG_JAPANESE, LANG_KOREAN};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, GetKeyboardLayout, MapVirtualKeyExW, ToUnicodeEx, MAPVK_VK_TO_VSC_EX, VIRTUAL_KEY,
-    VK_ACCEPT, VK_ADD, VK_APPS, VK_ATTN, VK_BACK, VK_BROWSER_BACK, VK_BROWSER_FAVORITES,
-    VK_BROWSER_FORWARD, VK_BROWSER_HOME, VK_BROWSER_REFRESH, VK_BROWSER_SEARCH, VK_BROWSER_STOP,
-    VK_CANCEL, VK_CAPITAL, VK_CLEAR, VK_CONTROL, VK_CONVERT, VK_CRSEL, VK_DECIMAL, VK_DELETE,
-    VK_DIVIDE, VK_DOWN, VK_END, VK_EREOF, VK_ESCAPE, VK_EXECUTE, VK_EXSEL, VK_F1, VK_F10, VK_F11,
-    VK_F12, VK_F13, VK_F14, VK_F15, VK_F16, VK_F17, VK_F18, VK_F19, VK_F2, VK_F20, VK_F21, VK_F22,
-    VK_F23, VK_F24, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_FINAL, VK_GAMEPAD_A,
-    VK_GAMEPAD_B, VK_GAMEPAD_DPAD_DOWN, VK_GAMEPAD_DPAD_LEFT, VK_GAMEPAD_DPAD_RIGHT,
-    VK_GAMEPAD_DPAD_UP, VK_GAMEPAD_LEFT_SHOULDER, VK_GAMEPAD_LEFT_THUMBSTICK_BUTTON,
-    VK_GAMEPAD_LEFT_THUMBSTICK_DOWN, VK_GAMEPAD_LEFT_THUMBSTICK_LEFT,
-    VK_GAMEPAD_LEFT_THUMBSTICK_RIGHT, VK_GAMEPAD_LEFT_THUMBSTICK_UP, VK_GAMEPAD_LEFT_TRIGGER,
-    VK_GAMEPAD_MENU, VK_GAMEPAD_RIGHT_SHOULDER, VK_GAMEPAD_RIGHT_THUMBSTICK_BUTTON,
+    GetKeyState, GetKeyboardLayout, MapVirtualKeyExW, ToUnicodeEx, HKL, MAPVK_VK_TO_VSC_EX,
+    VIRTUAL_KEY, VK_ACCEPT, VK_ADD, VK_APPS, VK_ATTN, VK_BACK, VK_BROWSER_BACK,
+    VK_BROWSER_FAVORITES, VK_BROWSER_FORWARD, VK_BROWSER_HOME, VK_BROWSER_REFRESH,
+    VK_BROWSER_SEARCH, VK_BROWSER_STOP, VK_CANCEL, VK_CAPITAL, VK_CLEAR, VK_CONTROL, VK_CONVERT,
+    VK_CRSEL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END, VK_EREOF, VK_ESCAPE, VK_EXECUTE,
+    VK_EXSEL, VK_F1, VK_F10, VK_F11, VK_F12, VK_F13, VK_F14, VK_F15, VK_F16, VK_F17, VK_F18,
+    VK_F19, VK_F2, VK_F20, VK_F21, VK_F22, VK_F23, VK_F24, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7,
+    VK_F8, VK_F9, VK_FINAL, VK_GAMEPAD_A, VK_GAMEPAD_B, VK_GAMEPAD_DPAD_DOWN, VK_GAMEPAD_DPAD_LEFT,
+    VK_GAMEPAD_DPAD_RIGHT, VK_GAMEPAD_DPAD_UP, VK_GAMEPAD_LEFT_SHOULDER,
+    VK_GAMEPAD_LEFT_THUMBSTICK_BUTTON, VK_GAMEPAD_LEFT_THUMBSTICK_DOWN,
+    VK_GAMEPAD_LEFT_THUMBSTICK_LEFT, VK_GAMEPAD_LEFT_THUMBSTICK_RIGHT,
+    VK_GAMEPAD_LEFT_THUMBSTICK_UP, VK_GAMEPAD_LEFT_TRIGGER, VK_GAMEPAD_MENU,
+    VK_GAMEPAD_RIGHT_SHOULDER, VK_GAMEPAD_RIGHT_THUMBSTICK_BUTTON,
     VK_GAMEPAD_RIGHT_THUMBSTICK_DOWN, VK_GAMEPAD_RIGHT_THUMBSTICK_LEFT,
     VK_GAMEPAD_RIGHT_THUMBSTICK_RIGHT, VK_GAMEPAD_RIGHT_THUMBSTICK_UP, VK_GAMEPAD_RIGHT_TRIGGER,
     VK_GAMEPAD_VIEW, VK_GAMEPAD_X, VK_GAMEPAD_Y, VK_HANGUL, VK_HANJA, VK_HELP, VK_HOME, VK_ICO_00,
@@ -39,7 +40,6 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_SCROLL, VK_SELECT, VK_SEPARATOR, VK_SHIFT, VK_SLEEP, VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT,
     VK_TAB, VK_UP, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP, VK_XBUTTON1, VK_XBUTTON2, VK_ZOOM,
 };
-use windows_sys::Win32::UI::TextServices::HKL;
 
 use crate::keyboard::{Key, KeyCode, ModifiersState, NamedKey, NativeKey, PhysicalKey};
 use crate::platform_impl::{loword, primarylangid, scancode_to_physicalkey};
@@ -279,7 +279,7 @@ impl LayoutCache {
         mods.set(ModifiersState::SHIFT, key_pressed(VK_SHIFT));
         mods.set(ModifiersState::CONTROL, key_pressed(VK_CONTROL) && !filter_out_altgr);
         mods.set(ModifiersState::ALT, key_pressed(VK_MENU) && !filter_out_altgr);
-        mods.set(ModifiersState::SUPER, key_pressed(VK_LWIN) || key_pressed(VK_RWIN));
+        mods.set(ModifiersState::META, key_pressed(VK_LWIN) || key_pressed(VK_RWIN));
         mods
     }
 
@@ -584,8 +584,8 @@ fn keycode_to_vkey(keycode: KeyCode, hkl: u64) -> VIRTUAL_KEY {
         KeyCode::ControlLeft => VK_LCONTROL,
         KeyCode::ControlRight => VK_RCONTROL,
         KeyCode::Enter => VK_RETURN,
-        KeyCode::SuperLeft => VK_LWIN,
-        KeyCode::SuperRight => VK_RWIN,
+        KeyCode::MetaLeft => VK_LWIN,
+        KeyCode::MetaRight => VK_RWIN,
         KeyCode::ShiftLeft => VK_RSHIFT,
         KeyCode::ShiftRight => VK_LSHIFT,
         KeyCode::Space => VK_SPACE,
@@ -670,7 +670,9 @@ fn keycode_to_vkey(keycode: KeyCode, hkl: u64) -> VIRTUAL_KEY {
         KeyCode::AudioVolumeMute => VK_VOLUME_MUTE,
         KeyCode::AudioVolumeUp => VK_VOLUME_UP,
         KeyCode::WakeUp => 0,
+        #[allow(deprecated)]
         KeyCode::Hyper => 0,
+        #[allow(deprecated)]
         KeyCode::Turbo => 0,
         KeyCode::Abort => 0,
         KeyCode::Resume => 0,
@@ -787,7 +789,7 @@ fn vkey_to_non_char_key(
         VK_NONCONVERT => Key::Named(NamedKey::NonConvert),
         VK_ACCEPT => Key::Named(NamedKey::Accept),
         VK_MODECHANGE => Key::Named(NamedKey::ModeChange),
-        VK_SPACE => Key::Named(NamedKey::Space),
+        VK_SPACE => Key::Character(" ".into()),
         VK_PRIOR => Key::Named(NamedKey::PageUp),
         VK_NEXT => Key::Named(NamedKey::PageDown),
         VK_END => Key::Named(NamedKey::End),
@@ -803,8 +805,8 @@ fn vkey_to_non_char_key(
         VK_INSERT => Key::Named(NamedKey::Insert),
         VK_DELETE => Key::Named(NamedKey::Delete),
         VK_HELP => Key::Named(NamedKey::Help),
-        VK_LWIN => Key::Named(NamedKey::Super),
-        VK_RWIN => Key::Named(NamedKey::Super),
+        VK_LWIN => Key::Named(NamedKey::Meta),
+        VK_RWIN => Key::Named(NamedKey::Meta),
         VK_APPS => Key::Named(NamedKey::ContextMenu),
         VK_SLEEP => Key::Named(NamedKey::Standby),
 
